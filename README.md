@@ -6,7 +6,9 @@ The service intentionally has no endpoint for changing images, commands, environ
 
 ## Run it
 
-Requirements are Go 1.26+ and a working Docker CLI/daemon. Copy and edit the example first:
+Requirements are Go 1.26.8+ and a working Docker CLI/daemon. The minimum patch
+version includes standard-library security fixes; rebuild existing binaries when
+updating the toolchain. Copy and edit the example first:
 
 ```sh
 cp fleet.example.json fleet.json

@@ -25,7 +25,7 @@ func NewHandler(manager *fleet.Manager, logger *slog.Logger) http.Handler {
 func RequireBearerToken(next http.Handler, token string) http.Handler {
 	expected := []byte("Bearer " + token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/v1/") {
+		if r.Method == http.MethodGet && (r.URL.Path == "/healthz" || r.URL.Path == "/readyz") {
 			next.ServeHTTP(w, r)
 			return
 		}

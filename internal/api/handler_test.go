@@ -124,22 +124,38 @@ func TestHandlerListsModelsWithDocumentedShape(t *testing.T) {
 	}
 }
 
-func TestBearerAuthenticationProtectsV1Only(t *testing.T) {
+func TestBearerAuthenticationProtectsEverythingExceptHealth(t *testing.T) {
 	handler := RequireBearerToken(newTestHandler(t), "test-token")
 
-	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	recorder := httptest.NewRecorder()
-	handler.ServeHTTP(recorder, request)
-	if recorder.Code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated status = %d, body = %s", recorder.Code, recorder.Body.String())
-	}
-	if recorder.Header().Get("WWW-Authenticate") == "" {
-		t.Fatal("unauthenticated response missing WWW-Authenticate")
+	for _, tt := range []struct {
+		name   string
+		method string
+		path   string
+		body   string
+	}{
+		{"canonical models list", http.MethodGet, "/v1/models", ""},
+		{"double slash models list", http.MethodGet, "//v1/models", ""},
+		{"encoded leading slash models list", http.MethodGet, "/%2fv1/models", ""},
+		{"double slash mutation", http.MethodPost, "//v1/models/alpha/load", ""},
+		{"encoded slash mutation", http.MethodPost, "/v1%2fmodels/alpha/load", ""},
+		{"unknown route", http.MethodGet, "/not-found", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			request := httptest.NewRequest(tt.method, tt.path, bytes.NewBufferString(tt.body))
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, request)
+			if recorder.Code != http.StatusUnauthorized {
+				t.Fatalf("unauthenticated status = %d, body = %s", recorder.Code, recorder.Body.String())
+			}
+			if recorder.Header().Get("WWW-Authenticate") == "" {
+				t.Fatal("unauthenticated response missing WWW-Authenticate")
+			}
+		})
 	}
 
-	request = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	request := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	request.Header.Set("Authorization", "Bearer test-token")
-	recorder = httptest.NewRecorder()
+	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("authenticated status = %d, body = %s", recorder.Code, recorder.Body.String())
@@ -150,6 +166,13 @@ func TestBearerAuthenticationProtectsV1Only(t *testing.T) {
 	handler.ServeHTTP(recorder, request)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("health status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "/readyz", nil)
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code == http.StatusUnauthorized {
+		t.Fatalf("ready endpoint should remain public, body = %s", recorder.Body.String())
 	}
 }
 

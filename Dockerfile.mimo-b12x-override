@@ -1,0 +1,5 @@
+FROM madeby561/vllm@sha256:311d7d302bcb3ee964247620ca68aaec1cb39ddced7761258ea461b79c6f381f
+
+COPY overrides/patch_b12x_mixed_device_cache.py /tmp/patch_b12x_mixed_device_cache.py
+RUN /opt/venv/bin/python /tmp/patch_b12x_mixed_device_cache.py \
+    && rm /tmp/patch_b12x_mixed_device_cache.py

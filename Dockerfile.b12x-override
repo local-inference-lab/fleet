@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=ghcr.io/local-inference-lab/vllm@sha256:55e477ad62ae15a77c9b869e8fb8e2d958f6edcc4d95e306adfa89dee9ed19df
+FROM ${BASE_IMAGE}
+
+ARG B12X_REF=f20ab3bad7def65f6211403fb73f9b1e8a33dfb0
+
+RUN /opt/venv/bin/python -m pip install --no-deps --force-reinstall \
+    "b12x @ git+https://github.com/local-inference-lab/b12x.git@${B12X_REF}"
+
+LABEL ai.local-inference-lab.lil-fleet.b12x_ref="${B12X_REF}"

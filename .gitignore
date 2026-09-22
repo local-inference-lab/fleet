@@ -1,0 +1,15 @@
+/fleet.json
+/lil-fleet
+/.cache/
+/.secrets/
+/.omx/
+/.codex/
+/.agents/
+/AGENTS.md
+/.env
+/.env.*
+/fleet.local*.json
+/fleet.*.local.json
+*.pem
+*.key
+*.log

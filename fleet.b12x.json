@@ -1,0 +1,227 @@
+{
+  "version": 1,
+  "api": { "listen": "127.0.0.1:8090" },
+  "runtime": {
+    "docker_binary": "docker",
+    "poll_interval": "5s",
+    "operation_timeout": "2m",
+    "readiness_timeout": "45m",
+    "remove_on_unload": true,
+    "concurrent_deployments": true,
+    "model_port_range": {"start": 8101, "end": 8109},
+    "gpu_topology": {
+      "groups": [[0, 1, 6, 7], [2, 3, 4, 5]],
+      "max_used_memory_mib": 1024
+    }
+  },
+  "models": [
+    {
+      "id": "ds41-flash-tp4-ssd",
+      "description": "DeepSeek V4.1 Flash TP4 with disk-backed Engram tables",
+      "image": "lil-fleet/b12x:f20ab3bad7de",
+      "entrypoint": "/usr/local/bin/lil-serve",
+      "command": ["--profile", "ds41-flash", "--hardware", "rtx-pro-6000-pcie", "--model", "/models/deepseek-v4.1-flash", "--tensor-parallel-size", "4", "--port", "8101", "--engram-config", "{\"cpu_offload\":false,\"table_memory\":\"disk\",\"disk_resident_scales\":false,\"projection_tp\":false}"],
+      "mounts": [
+        {"source": "/srv/fleet/models/deepseek-v4.1-flash", "target": "/models/deepseek-v4.1-flash", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 4, "strategy": "pcie_affinity"},
+      "network_mode": "host", "ipc": "private", "shm_size": "32g", "init": true,
+      "security_opt": ["seccomp=overrides/seccomp-deepseek-io-uring.json"],
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8101/health", "success_status": 200}
+    },
+    {
+      "id": "glm53-flash-tp4",
+      "description": "GLM 5.3 Flash NVFP4 TP4 with MTP3",
+      "image": "lil-fleet/b12x:f20ab3bad7de",
+      "entrypoint": "/usr/local/bin/lil-serve",
+      "command": ["--profile", "glm53-flash", "--hardware", "rtx-pro-6000-pcie", "--model", "/models/GLM-5.3-Flash-NVFP4", "--tensor-parallel-size", "4", "--mode", "mtp", "--draft-tokens", "3", "--port", "8102"],
+      "mounts": [
+        {"source": "/srv/fleet/models/GLM-5.3-Flash-NVFP4", "target": "/models/GLM-5.3-Flash-NVFP4", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 4, "strategy": "pcie_affinity"},
+      "network_mode": "host", "ipc": "host", "shm_size": "32g", "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8102/health", "success_status": 200}
+    },
+    {
+      "id": "glm53-tp6",
+      "description": "GLM 5.3 NVFP4 TP6 experimental profile; leaves two GPUs available",
+      "image": "voipmonitor/vllm@sha256:2ddd49e4ee162ea79a0f2e537aec3e18918bef168e3d684cfa5332151c7fbe2e",
+      "entrypoint": "/opt/venv/bin/python",
+      "command": ["-m", "vllm.entrypoints.cli.main", "serve", "/models/GLM-5.3-NVFP4", "--served-model-name", "GLM-5.3", "--tensor-parallel-size", "6", "--decode-context-parallel-size", "1", "--moe-backend", "b12x", "--linear-backend", "b12x", "--quantization", "modelopt", "--load-format", "instanttensor", "--kv-cache-dtype", "fp8", "--gpu-memory-utilization", "0.96", "--max-model-len", "400000", "--max-num-seqs", "4", "--max-num-batched-tokens", "2048", "--host", "0.0.0.0", "--port", "8103"],
+      "environment": {"INSTANTTENSOR_BACKEND": "BUFFERED", "VLLM_WORKER_MULTIPROC_METHOD": "spawn", "VLLM_ENABLE_PCIE_ALLREDUCE": "0"},
+      "mounts": [
+        {"source": "/srv/fleet/models/GLM-5.3-NVFP4", "target": "/models/GLM-5.3-NVFP4", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 6, "strategy": "pcie_affinity"},
+      "network_mode": "host", "ipc": "host", "shm_size": "32g", "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8103/health", "success_status": 200}
+    },
+    {
+      "id": "glm53-tp8",
+      "description": "GLM 5.3 NVFP4 TP8",
+      "image": "lil-fleet/b12x:f20ab3bad7de",
+      "entrypoint": "/opt/venv/bin/python",
+      "command": ["-m", "vllm.entrypoints.cli.main", "serve", "/models/GLM-5.3-NVFP4", "--served-model-name", "GLM-5.3", "--tensor-parallel-size", "8", "--decode-context-parallel-size", "1", "--moe-backend", "b12x", "--linear-backend", "b12x", "--quantization", "modelopt", "--load-format", "instanttensor", "--kv-cache-dtype", "fp8", "--gpu-memory-utilization", "0.96", "--max-model-len", "400000", "--max-num-seqs", "4", "--max-num-batched-tokens", "2048", "--host", "0.0.0.0", "--port", "8104"],
+      "environment": {"INSTANTTENSOR_BACKEND": "BUFFERED", "VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
+      "mounts": [
+        {"source": "/srv/fleet/models/GLM-5.3-NVFP4", "target": "/models/GLM-5.3-NVFP4", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 8, "strategy": "pcie_affinity"},
+      "network_mode": "host", "ipc": "host", "shm_size": "32g", "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8104/health", "success_status": 200}
+    },
+    {
+      "id": "qwen38-27b-flash-tp1",
+      "description": "Qwen 3.8 27B FP8 TP1 experimental profile with FlashInfer attention and MTP3",
+      "image": "lil-fleet/b12x:f20ab3bad7de",
+      "entrypoint": "/opt/venv/bin/python",
+      "command": ["-m", "vllm.entrypoints.cli.main", "serve", "/models/Qwen3.8-27B-FP8/snapshots/017b9c7af6b5689d5dd426a76e0bc077eb5ca20a", "--served-model-name", "Qwen3.8-27B", "--tensor-parallel-size", "1", "--attention-backend", "flashinfer", "--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"greedy\",\"attention_backend\":\"flashinfer\"}", "--enable-auto-tool-choice", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_xml", "--enable-prefix-caching", "--gpu-memory-utilization", "0.94", "--max-model-len", "262144", "--max-num-seqs", "512", "--max-num-batched-tokens", "4096", "--host", "0.0.0.0", "--port", "8105"],
+      "environment": {"VLLM_WORKER_MULTIPROC_METHOD": "spawn"},
+      "mounts": [
+        {"source": "/srv/fleet/.cache/huggingface/hub/models--Qwen--Qwen3.8-27B-FP8", "target": "/models/Qwen3.8-27B-FP8", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 1, "strategy": "pcie_affinity"},
+      "network_mode": "host", "ipc": "host", "shm_size": "32g", "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8105/health", "success_status": 200}
+    },
+    {
+      "id": "qwen38-flash-next-tp2-ssd",
+      "description": "Qwen 3.8 Flash Next TP2 with disk-backed PLE tables",
+      "image": "lil-fleet/b12x:f20ab3bad7de",
+      "entrypoint": "/usr/local/bin/lil-serve",
+      "command": ["--profile", "qwen38-flash-next", "--hardware", "rtx-pro-6000-pcie", "--env", "VLLM_PLE_CPU_OFFLOAD=1", "--env", "VLLM_PLE_TABLE_MEMORY=disk", "--model", "/models/Qwen3.8-Flash-Next-NVFP4", "--tensor-parallel-size", "2", "--port", "8106"],
+      "mounts": [
+        {"source": "/srv/fleet/models/Qwen3.8-Flash-Next-NVFP4", "target": "/models/Qwen3.8-Flash-Next-NVFP4", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 2, "strategy": "pcie_affinity"},
+      "network_mode": "host", "ipc": "host", "shm_size": "32g", "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8106/health", "success_status": 200}
+    },
+    {
+      "id": "qwen38-flash-next-tp3-ssd",
+      "description": "Qwen 3.8 Flash Next TP3 with disk-backed PLE tables (experimental)",
+      "image": "lil-fleet/b12x:f20ab3bad7de",
+      "entrypoint": "/usr/local/bin/lil-serve",
+      "command": ["--profile", "qwen38-flash-next", "--hardware", "rtx-pro-6000-pcie", "--env", "VLLM_PLE_CPU_OFFLOAD=1", "--env", "VLLM_PLE_TABLE_MEMORY=disk", "--model", "/models/Qwen3.8-Flash-Next-NVFP4", "--tensor-parallel-size", "3", "--port", "8107"],
+      "mounts": [
+        {"source": "/srv/fleet/models/Qwen3.8-Flash-Next-NVFP4", "target": "/models/Qwen3.8-Flash-Next-NVFP4", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 3, "strategy": "pcie_affinity"},
+      "network_mode": "host", "ipc": "host", "shm_size": "32g", "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8107/health", "success_status": 200}
+    },
+    {
+      "id": "qwen38-flash-next-tp4-vram",
+      "description": "Qwen 3.8 Flash Next TP4 with PLE tables resident in VRAM",
+      "image": "lil-fleet/b12x:f20ab3bad7de",
+      "entrypoint": "/usr/local/bin/lil-serve",
+      "command": ["--profile", "qwen38-flash-next", "--hardware", "rtx-pro-6000-pcie", "--env", "VLLM_PLE_CPU_OFFLOAD=0", "--model", "/models/Qwen3.8-Flash-Next-NVFP4", "--tensor-parallel-size", "4", "--port", "8108"],
+      "mounts": [
+        {"source": "/srv/fleet/models/Qwen3.8-Flash-Next-NVFP4", "target": "/models/Qwen3.8-Flash-Next-NVFP4", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 4, "strategy": "pcie_affinity"},
+      "network_mode": "host", "ipc": "host", "shm_size": "32g", "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8108/health", "success_status": 200}
+    },
+    {
+      "id": "mimo-v26-flash-tp4",
+      "description": "MiMo 2.6 Flash RL TP4 with DFlash speculative decoding and B12X PCIe collectives",
+      "image": "lil-fleet/mimo-v26-flash:b12x-mixed-device",
+      "command": [
+        "serve",
+        "/model",
+        "--served-model-name",
+        "MiMo-V2.6-Flash-RL",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8109",
+        "--tensor-parallel-size",
+        "4",
+        "--trust-remote-code",
+        "--max-model-len",
+        "1048576",
+        "--max-num-seqs",
+        "32",
+        "--max-num-batched-tokens",
+        "8192",
+        "--gpu-memory-utilization",
+        "0.95",
+        "--kv-cache-dtype",
+        "fp8",
+        "--block-size",
+        "64",
+        "--enable-prefix-caching",
+        "--enable-chunked-prefill",
+        "--async-scheduling",
+        "--no-scheduler-reserve-full-isl",
+        "--hf-overrides",
+        "{\"architectures\":[\"MiMoV2OmniForCausalLM\"]}",
+        "--reasoning-parser",
+        "mimo",
+        "--tool-call-parser",
+        "mimo",
+        "--enable-auto-tool-choice",
+        "--generation-config",
+        "vllm",
+        "--attention-backend",
+        "TRITON_ATTN",
+        "--mm-encoder-attn-backend",
+        "TRITON_ATTN",
+        "--moe-backend",
+        "b12x",
+        "--linear-backend",
+        "deep_gemm",
+        "--max-cudagraph-capture-size",
+        "256",
+        "--compilation-config",
+        "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}",
+        "--speculative-config",
+        "{\"method\":\"dflash\",\"model\":\"/opt/mimo-v26/dflash-fixed\",\"num_speculative_tokens\":7,\"draft_tensor_parallel_size\":4,\"max_model_len\":1048576,\"enable_adaptive_verification\":true}"
+      ],
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3",
+        "VLLM_CACHE_ROOT": "/cache",
+        "VLLM_LOGGING_LEVEL": "INFO",
+        "VLLM_KV_CACHE_LAYOUT": "BLHNC",
+        "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": "32768",
+        "VLLM_ENABLE_PCIE_ALLREDUCE": "1",
+        "VLLM_PCIE_ALLREDUCE_BACKEND": "b12x",
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": "64KB",
+        "B12X_TUNING_DEVICE_CLASS": "sm_120a-rtx-pro-6000",
+        "NCCL_IB_DISABLE": "1",
+        "NCCL_P2P_LEVEL": "SYS",
+        "NCCL_PROTO": "LL,LL128,Simple",
+        "CUTE_DSL_ARCH": "sm_120a"
+      },
+      "mounts": [
+        {"source": "/srv/fleet/models/MiMo-V2.6-Flash-RL", "target": "/model", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 4, "strategy": "pcie_affinity"},
+      "network_mode": "host",
+      "ipc": "private",
+      "shm_size": "32g",
+      "restart": "unless-stopped",
+      "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8109/health", "success_status": 200}
+    }
+  ]
+}

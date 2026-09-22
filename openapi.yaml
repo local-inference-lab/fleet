@@ -1,0 +1,208 @@
+openapi: 3.1.0
+info:
+  title: lil-fleet API
+  version: 1.0.0
+  description: Manifest-locked lifecycle control for Docker-hosted inference models.
+servers:
+  - url: http://127.0.0.1:8090
+security:
+  - bearerAuth: []
+paths:
+  /healthz:
+    get:
+      security: []
+      operationId: health
+      responses:
+        "200": {description: Process is alive}
+  /readyz:
+    get:
+      security: []
+      operationId: ready
+      responses:
+        "200": {description: Docker state is available}
+        "503": {description: Docker state is unavailable, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+  /v1/models:
+    get:
+      operationId: listModels
+      responses:
+        "200":
+          description: Configured models with deployment state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [models]
+                properties:
+                  models:
+                    type: array
+                    items: {$ref: "#/components/schemas/ModelWithStatus"}
+  /v1/models/{modelId}:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      operationId: getModel
+      responses:
+        "200": {description: Configured model, content: {application/json: {schema: {$ref: "#/components/schemas/ModelWithStatus"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/models/{modelId}/load:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    post:
+      operationId: loadModel
+      description: Accepts no request body. Activation either performs an exclusive switch or reserves manifest-approved GPUs when concurrency is enabled.
+      responses:
+        "200": {description: Model was already ready}
+        "202": {$ref: "#/components/responses/OperationAccepted"}
+        "400": {description: A request body or override was supplied, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/models/{modelId}/unload:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    post:
+      operationId: unloadModel
+      description: Accepts no request body.
+      responses:
+        "200": {description: Model was already unloaded}
+        "202": {$ref: "#/components/responses/OperationAccepted"}
+        "400": {description: A request body or override was supplied, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/deployments/switch:
+    post:
+      operationId: switchModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [model_id]
+              properties:
+                model_id: {type: string}
+      responses:
+        "200": {description: Model was already ready}
+        "202": {$ref: "#/components/responses/OperationAccepted"}
+        "400": {description: Invalid body or attempted override, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+        "409": {$ref: "#/components/responses/Conflict"}
+  /v1/deployments:
+    get:
+      operationId: listDeployments
+      responses:
+        "200":
+          description: All deployment states
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deployments]
+                properties:
+                  deployments:
+                    type: array
+                    items: {$ref: "#/components/schemas/DeploymentStatus"}
+  /v1/deployments/{modelId}:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      operationId: getDeployment
+      responses:
+        "200": {description: Deployment state, content: {application/json: {schema: {$ref: "#/components/schemas/DeploymentStatus"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /v1/operations/{operationId}:
+    parameters:
+      - name: operationId
+        in: path
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getOperation
+      responses:
+        "200": {description: Lifecycle operation, content: {application/json: {schema: {$ref: "#/components/schemas/Operation"}}}}
+        "404": {$ref: "#/components/responses/NotFound"}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+  parameters:
+    ModelId:
+      name: modelId
+      in: path
+      required: true
+      schema: {type: string, pattern: "^[a-z0-9][a-z0-9._-]{0,62}$"}
+  responses:
+    OperationAccepted:
+      description: Lifecycle operation accepted
+      headers:
+        Location:
+          schema: {type: string}
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [changed, operation]
+            properties:
+              changed: {type: boolean}
+              operation: {$ref: "#/components/schemas/Operation"}
+    NotFound:
+      description: Model or operation not found
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+    Conflict:
+      description: A conflicting lifecycle operation is active or insufficient topology-compatible GPUs are free
+      content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
+  schemas:
+    Model:
+      type: object
+      required: [id, image]
+      properties:
+        id: {type: string}
+        description: {type: string}
+        image: {type: string}
+    ModelWithStatus:
+      type: object
+      required: [model, status]
+      properties:
+        model: {$ref: "#/components/schemas/Model"}
+        status: {$ref: "#/components/schemas/DeploymentStatus"}
+    DeploymentStatus:
+      type: object
+      required: [model_id, phase, desired_state, last_checked]
+      properties:
+        model_id: {type: string}
+        phase: {type: string, enum: [unloaded, loading, ready, unhealthy, stopping, failed, unknown]}
+        desired_state: {type: string, enum: [unloaded, ready]}
+        container_status: {type: string}
+        health: {type: string}
+        exit_code: {type: integer}
+        oom_killed: {type: boolean}
+        assigned_gpus:
+          type: array
+          items: {type: integer, minimum: 0}
+        last_error: {type: string}
+        last_checked: {type: string, format: date-time}
+    Operation:
+      type: object
+      required: [id, kind, model_id, state, created_at]
+      properties:
+        id: {type: string}
+        kind: {type: string, enum: [activate, unload]}
+        model_id: {type: string}
+        state: {type: string, enum: [pending, running, succeeded, failed]}
+        error: {type: string}
+        created_at: {type: string, format: date-time}
+        started_at: {type: string, format: date-time}
+        finished_at: {type: string, format: date-time}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: {type: string}
+            message: {type: string}
+        details: {type: object, additionalProperties: true}

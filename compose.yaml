@@ -1,0 +1,11 @@
+services:
+  lil-fleet:
+    build: .
+    command: ["-manifest", "/etc/lil-fleet/fleet.json", "-token-file", "/run/secrets/lil-fleet-token"]
+    ports:
+      - "127.0.0.1:8090:8090"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./fleet.json:/etc/lil-fleet/fleet.json:ro
+      - ./.secrets/api-token:/run/secrets/lil-fleet-token:ro
+    restart: unless-stopped

@@ -1,0 +1,5 @@
+/fleet.json
+/lil-fleet
+/.cache/
+/.secrets/
+*.log

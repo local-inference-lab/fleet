@@ -1,0 +1,14 @@
+.git
+.omx
+.codex
+.agents
+.secrets
+.env
+.env.*
+AGENTS.md
+fleet.json
+fleet.local*.json
+fleet.*.local.json
+*.pem
+*.key
+*.log

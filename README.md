@@ -92,6 +92,36 @@ The `mimo-v26-flash-kk-winner` profile serves `XiaomiMiMo/MiMo-V2.6-Flash-RL` fr
 
 The main image is the current Karmic release with B12X pinned from source. The true-TP6 GLM profile is an explicit compatibility exception: it pins the documented Eldritch head-padding runtime (including its matching bundled B12X), because current B12X cannot be overlaid on that older vLLM API and the current Karmic runtime has dropped the virtual-TP padding layer.
 
+### DeepSeek and MiMo isolation
+
+These two TP4 profiles use private IPC namespaces with 32 GiB of `/dev/shm`;
+their workers share memory within the container without joining host IPC. MiMo
+uses Docker's default seccomp filter. DeepSeek's disk-backed Engram reader needs
+`io_uring_setup`, `io_uring_enter`, and `io_uring_register`, so it uses
+[`overrides/seccomp-deepseek-io-uring.json`](overrides/seccomp-deepseek-io-uring.json):
+the [Docker 29.4.1 default profile](https://github.com/moby/moby/blob/docker-v29.4.1/vendor/github.com/moby/profiles/seccomp/default.json)
+with only those three syscalls added. No extra capabilities are granted.
+The upstream policy is Copyright The Moby Authors, under the
+[Apache 2.0 license](overrides/LICENSE.seccomp); the added rule carries the
+modification notice. A regression test checks the rest of the policy against
+the pinned upstream JSON checksum.
+
+Run Fleet from the repository root (including the service's `WorkingDirectory`)
+so Docker's CLI can read that relative profile path. For another working
+directory, use an absolute `seccomp=` path available to the Docker CLI. Manifest
+changes require a controller restart and a model unload/load to recreate the
+container; restarting the controller alone does not update running containers.
+Rebase the custom profile when upgrading Docker so it receives future default
+policy improvements.
+
+This is defense in depth, not VM isolation: GPU access, host networking, existing
+mounts, and memory limits remain unchanged. In particular, Docker blocks
+[`io_uring` by default for security reasons](https://docs.docker.com/engine/security/seccomp/).
+The DeepSeek exception retains that kernel attack surface and cannot restrict
+individual io_uring operations to reads through ordinary seccomp argument rules.
+Keep the host kernel and NVIDIA driver patched; do not reuse this exception for
+models that work with the default filter.
+
 ### Routes
 
 | Method | Route | Purpose |

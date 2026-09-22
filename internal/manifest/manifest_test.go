@@ -1,8 +1,12 @@
 package manifest
 
 import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -222,6 +226,26 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if cfg.Runtime.ModelPortRange == nil || cfg.Runtime.ModelPortRange.Start != 8101 || cfg.Runtime.ModelPortRange.End != 8109 {
 		t.Fatalf("B12X model port range = %+v, want 8101-8109", cfg.Runtime.ModelPortRange)
 	}
+	for _, id := range []string{"ds41-flash-tp4-ssd", "mimo-v26-flash-kk-winner"} {
+		t.Run(id+"/isolation", func(t *testing.T) {
+			model, ok := cfg.Model(id)
+			if !ok {
+				t.Fatalf("model %q missing", id)
+			}
+			// TP workers share a container, not the host IPC namespace. Keep
+			// enough private shared memory without disabling Docker's filter.
+			if model.IPC != "private" || model.ShmSize != "32g" {
+				t.Fatalf("IPC/shared memory = %q/%q, want private/32g", model.IPC, model.ShmSize)
+			}
+			if id == "ds41-flash-tp4-ssd" {
+				if len(model.SecurityOpt) != 1 || model.SecurityOpt[0] != "seccomp=overrides/seccomp-deepseek-io-uring.json" {
+					t.Fatalf("DeepSeek security options = %v, want the scoped io_uring policy", model.SecurityOpt)
+				}
+			} else if len(model.SecurityOpt) != 0 {
+				t.Fatalf("MiMo security options = %v, want Docker defaults", model.SecurityOpt)
+			}
+		})
+	}
 	mimo, ok := cfg.Model("mimo-v26-flash-kk-winner")
 	if !ok {
 		t.Fatal("MiMo 2.6 Flash profile missing")
@@ -247,6 +271,44 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	}
 	if !foundMMBackend {
 		t.Fatal("MiMo must use the Triton multimodal encoder backend")
+	}
+}
+
+func TestDeepSeekSeccompOnlyAddsRequiredIOUringCalls(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "overrides", "seccomp-deepseek-io-uring.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile map[string]any
+	if err := json.Unmarshal(raw, &profile); err != nil {
+		t.Fatal(err)
+	}
+	rules, ok := profile["syscalls"].([]any)
+	if !ok || len(rules) == 0 {
+		t.Fatal("seccomp syscall rules missing")
+	}
+	exception, ok := rules[0].(map[string]any)
+	if !ok {
+		t.Fatal("io_uring exception missing")
+	}
+	delete(exception, "comment")
+	want := map[string]any{
+		"names":  []any{"io_uring_setup", "io_uring_enter", "io_uring_register"},
+		"action": "SCMP_ACT_ALLOW",
+	}
+	if !reflect.DeepEqual(exception, want) {
+		t.Fatalf("io_uring exception = %v, want %v", exception, want)
+	}
+	profile["syscalls"] = rules[1:]
+	base, err := json.Marshal(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Canonical JSON SHA-256 of Docker 29.4.1's vendored default profile.
+	// Rebase deliberately on Docker upgrades; do not quietly widen the policy.
+	const defaultProfileSHA256 = "7ce699efbba58df5691185a87189ecc0a47ff01c48ec8fc5708465954b672979"
+	if got := fmt.Sprintf("%x", sha256.Sum256(base)); got != defaultProfileSHA256 {
+		t.Fatalf("base seccomp policy differs from the pinned Docker default: %s", got)
 	}
 }
 

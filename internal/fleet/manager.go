@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"reflect"
 	"sort"
 	"sync"
 	"time"
@@ -117,15 +118,14 @@ func (m *Manager) Start() {
 	m.cancel = cancel
 	go func() {
 		defer close(m.done)
-		ticker := time.NewTicker(m.manifest.Runtime.PollDuration())
-		defer ticker.Stop()
-		m.refresh(ctx)
 		for {
+			m.refresh(ctx)
+			timer := time.NewTimer(m.pollDuration())
 			select {
 			case <-ctx.Done():
+				timer.Stop()
 				return
-			case <-ticker.C:
-				m.refresh(ctx)
+			case <-timer.C:
 			}
 		}
 	}()
@@ -140,11 +140,66 @@ func (m *Manager) Close() {
 }
 
 func (m *Manager) Models() []ModelInfo {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	models := make([]ModelInfo, 0, len(m.manifest.Models))
 	for _, model := range m.manifest.Models {
 		models = append(models, ModelInfo{ID: model.ID, Description: model.Description, Image: model.Image})
 	}
 	return models
+}
+
+// ReloadManifest atomically replaces the active manifest after checking that
+// the update cannot orphan or silently mutate a running deployment.
+func (m *Manager) ReloadManifest(next *manifest.Manifest) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.inFlight != "" {
+		return errors.New("a lifecycle operation is in progress")
+	}
+	if next.API.Listen != m.manifest.API.Listen {
+		return errors.New("api.listen cannot be changed without restarting fleet")
+	}
+	if next.Runtime.DockerBinary != m.manifest.Runtime.DockerBinary {
+		return errors.New("runtime.docker_binary cannot be changed without restarting fleet")
+	}
+
+	for _, current := range m.manifest.Models {
+		replacement, present := next.Model(current.ID)
+		status := m.statuses[current.ID]
+		if manifestModelCanChange(status) {
+			continue
+		}
+		if !present {
+			return fmt.Errorf("model %q cannot be removed while its deployment is active", current.ID)
+		}
+		if !reflect.DeepEqual(current, replacement) {
+			return fmt.Errorf("model %q cannot be changed while its deployment is active", current.ID)
+		}
+	}
+
+	statuses := make(map[string]Status, len(next.Models))
+	for _, model := range next.Models {
+		status, present := m.statuses[model.ID]
+		if !present {
+			status = Status{ModelID: model.ID, Phase: PhaseUnknown, Desired: "unloaded"}
+		}
+		statuses[model.ID] = status
+	}
+	m.manifest = next
+	m.statuses = statuses
+	return nil
+}
+
+func manifestModelCanChange(status Status) bool {
+	return status.Phase == PhaseUnloaded || status.Phase == PhaseFailed
+}
+
+func (m *Manager) pollDuration() time.Duration {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.manifest.Runtime.PollDuration()
 }
 
 func (m *Manager) Statuses() []Status {
@@ -173,10 +228,13 @@ func (m *Manager) Operation(id string) (Operation, bool) {
 }
 
 func (m *Manager) Activate(modelID string) (Operation, bool, error) {
-	if _, ok := m.manifest.Model(modelID); !ok {
+	m.mu.Lock()
+	cfg := m.manifest
+	model, ok := cfg.Model(modelID)
+	if !ok {
+		m.mu.Unlock()
 		return Operation{}, false, fmt.Errorf("unknown model %q", modelID)
 	}
-	m.mu.Lock()
 	if m.inFlight != "" {
 		op := m.operations[m.inFlight]
 		if op.Kind == "activate" && op.ModelID == modelID {
@@ -186,14 +244,13 @@ func (m *Manager) Activate(modelID string) (Operation, bool, error) {
 		m.mu.Unlock()
 		return Operation{}, false, &ConflictError{Operation: op}
 	}
-	if m.isReadyNoopLocked(modelID) {
+	if m.isReadyNoopLocked(modelID, cfg) {
 		status := m.statuses[modelID]
 		status.Desired = "ready"
 		m.statuses[modelID] = status
 		m.mu.Unlock()
 		return Operation{}, true, nil
 	}
-	model, _ := m.manifest.Model(modelID)
 	var assignedGPUs []int
 	if model.Placement != nil {
 		devices, err := m.gpus.Snapshot(context.Background())
@@ -202,8 +259,8 @@ func (m *Manager) Activate(modelID string) (Operation, bool, error) {
 			return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
 		}
 		allocator := gpu.Allocator{Topology: gpu.Topology{
-			Groups:           m.manifest.Runtime.GPUTopology.Groups,
-			MaxUsedMemoryMiB: m.manifest.Runtime.GPUTopology.MaxUsedMemoryMiB,
+			Groups:           cfg.Runtime.GPUTopology.Groups,
+			MaxUsedMemoryMiB: cfg.Runtime.GPUTopology.MaxUsedMemoryMiB,
 		}}
 		var reserved []int
 		for id, status := range m.statuses {
@@ -231,15 +288,15 @@ func (m *Manager) Activate(modelID string) (Operation, bool, error) {
 	m.operations[op.ID] = op
 	m.inFlight = op.ID
 	m.mu.Unlock()
-	go m.runActivate(op.ID, modelID, assignedGPUs)
+	go m.runActivate(op.ID, cfg, model, assignedGPUs)
 	return op, false, nil
 }
 
-func (m *Manager) isReadyNoopLocked(modelID string) bool {
+func (m *Manager) isReadyNoopLocked(modelID string, cfg *manifest.Manifest) bool {
 	if m.statuses[modelID].Phase != PhaseReady {
 		return false
 	}
-	if m.manifest.Runtime.ConcurrentDeployments {
+	if cfg.Runtime.ConcurrentDeployments {
 		return true
 	}
 	for id, status := range m.statuses {
@@ -251,10 +308,13 @@ func (m *Manager) isReadyNoopLocked(modelID string) bool {
 }
 
 func (m *Manager) Unload(modelID string) (Operation, bool, error) {
-	if _, ok := m.manifest.Model(modelID); !ok {
+	m.mu.Lock()
+	cfg := m.manifest
+	model, ok := cfg.Model(modelID)
+	if !ok {
+		m.mu.Unlock()
 		return Operation{}, false, fmt.Errorf("unknown model %q", modelID)
 	}
-	m.mu.Lock()
 	if m.inFlight != "" {
 		op := m.operations[m.inFlight]
 		if op.Kind == "unload" && op.ModelID == modelID {
@@ -274,7 +334,7 @@ func (m *Manager) Unload(modelID string) (Operation, bool, error) {
 	m.operations[op.ID] = op
 	m.inFlight = op.ID
 	m.mu.Unlock()
-	go m.runUnload(op.ID, modelID)
+	go m.runUnload(op.ID, cfg, model)
 	return op, false, nil
 }
 
@@ -313,33 +373,33 @@ func (m *Manager) finishOperation(id string, err error) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) runActivate(operationID, modelID string, assignedGPUs []int) {
+func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model manifest.Model, assignedGPUs []int) {
+	modelID := model.ID
 	m.beginOperation(operationID)
-	ctx, cancel := context.WithTimeout(context.Background(), m.manifest.Runtime.ReadinessDuration())
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Runtime.ReadinessDuration())
 	defer cancel()
 
-	if !m.manifest.Runtime.ConcurrentDeployments {
-		for _, model := range m.manifest.Models {
-			if model.ID == modelID {
+	if !cfg.Runtime.ConcurrentDeployments {
+		for _, other := range cfg.Models {
+			if other.ID == modelID {
 				continue
 			}
-			m.updateTransition(model.ID, PhaseStopping, "unloaded")
-			opCtx, opCancel := context.WithTimeout(ctx, m.manifest.Runtime.OperationDuration())
-			err := m.driver.Stop(opCtx, model, m.manifest.Runtime.RemoveOnUnload)
+			m.updateTransition(other.ID, PhaseStopping, "unloaded")
+			opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
+			err := m.driver.Stop(opCtx, other, cfg.Runtime.RemoveOnUnload)
 			opCancel()
 			if err != nil {
-				m.setFailure(model.ID, err)
-				m.finishOperation(operationID, fmt.Errorf("unload %s before switch: %w", model.ID, err))
+				m.setFailure(other.ID, err)
+				m.finishOperation(operationID, fmt.Errorf("unload %s before switch: %w", other.ID, err))
 				return
 			}
-			m.setUnloaded(model.ID)
+			m.setUnloaded(other.ID)
 		}
 	}
 
-	model, _ := m.manifest.Model(modelID)
 	m.updateTransition(modelID, PhaseLoading, "ready")
 	m.setAssignedGPUs(modelID, assignedGPUs)
-	opCtx, opCancel := context.WithTimeout(ctx, m.manifest.Runtime.OperationDuration())
+	opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
 	err := m.driver.Start(opCtx, model, assignedGPUs)
 	opCancel()
 	if err != nil {
@@ -348,10 +408,10 @@ func (m *Manager) runActivate(operationID, modelID string, assignedGPUs []int) {
 		return
 	}
 
-	ticker := time.NewTicker(m.manifest.Runtime.PollDuration())
+	ticker := time.NewTicker(cfg.Runtime.PollDuration())
 	defer ticker.Stop()
 	for {
-		status := m.probe(ctx, model)
+		status := m.probe(ctx, model, cfg.Runtime)
 		if status.Phase == PhaseReady {
 			m.storeStatus(status)
 			m.finishOperation(operationID, nil)
@@ -377,13 +437,13 @@ func (m *Manager) runActivate(operationID, modelID string, assignedGPUs []int) {
 	}
 }
 
-func (m *Manager) runUnload(operationID, modelID string) {
+func (m *Manager) runUnload(operationID string, cfg *manifest.Manifest, model manifest.Model) {
+	modelID := model.ID
 	m.beginOperation(operationID)
-	model, _ := m.manifest.Model(modelID)
 	m.updateTransition(modelID, PhaseStopping, "unloaded")
-	ctx, cancel := context.WithTimeout(context.Background(), m.manifest.Runtime.OperationDuration())
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Runtime.OperationDuration())
 	defer cancel()
-	if err := m.driver.Stop(ctx, model, m.manifest.Runtime.RemoveOnUnload); err != nil {
+	if err := m.driver.Stop(ctx, model, cfg.Runtime.RemoveOnUnload); err != nil {
 		m.setFailure(modelID, err)
 		m.finishOperation(operationID, err)
 		return
@@ -393,9 +453,16 @@ func (m *Manager) runUnload(operationID, modelID string) {
 }
 
 func (m *Manager) refresh(ctx context.Context) {
-	for _, model := range m.manifest.Models {
-		status := m.probe(ctx, model)
+	m.mu.RLock()
+	cfg := m.manifest
+	m.mu.RUnlock()
+	for _, model := range cfg.Models {
+		status := m.probe(ctx, model, cfg.Runtime)
 		m.mu.RLock()
+		if m.manifest != cfg {
+			m.mu.RUnlock()
+			return
+		}
 		current := m.statuses[model.ID]
 		m.mu.RUnlock()
 		if current.Phase == PhaseLoading && status.Phase != PhaseReady && status.Phase != PhaseFailed {
@@ -407,12 +474,18 @@ func (m *Manager) refresh(ctx context.Context) {
 			status.Phase = PhaseStopping
 			status.Desired = "unloaded"
 		}
-		m.storeStatus(status)
+		m.mu.Lock()
+		if m.manifest != cfg {
+			m.mu.Unlock()
+			return
+		}
+		m.statuses[status.ModelID] = status
+		m.mu.Unlock()
 	}
 }
 
-func (m *Manager) probe(parent context.Context, model manifest.Model) Status {
-	ctx, cancel := context.WithTimeout(parent, m.manifest.Runtime.OperationDuration())
+func (m *Manager) probe(parent context.Context, model manifest.Model, runtime manifest.RuntimeConfig) Status {
+	ctx, cancel := context.WithTimeout(parent, runtime.OperationDuration())
 	defer cancel()
 	now := time.Now().UTC()
 	state, err := m.driver.Inspect(ctx, model)

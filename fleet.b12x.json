@@ -222,6 +222,57 @@
       "init": true,
       "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
       "readiness": {"url": "http://127.0.0.1:8109/health", "success_status": 200}
+    },
+    {
+      "id": "mimo-v26-pro-tp8",
+      "description": "MiMo 2.6 Pro RL across all eight GPUs with its own DFlash draft",
+      "image": "lil-fleet/mimo-v26-flash:b12x-mixed-device",
+      "command": [
+        "serve", "/model", "--served-model-name", "MiMo-V2.6-Pro-RL",
+        "--host", "0.0.0.0", "--port", "8109",
+        "--tensor-parallel-size", "8", "--trust-remote-code",
+        "--safetensors-load-strategy", "lazy",
+        "--max-model-len", "auto", "--max-num-seqs", "8",
+        "--max-num-batched-tokens", "8192", "--gpu-memory-utilization", "0.95",
+        "--kv-cache-dtype", "fp8", "--block-size", "64",
+        "--enable-prefix-caching", "--enable-chunked-prefill", "--async-scheduling",
+        "--no-scheduler-reserve-full-isl",
+        "--hf-overrides", "{\"architectures\":[\"MiMoV2OmniForCausalLM\"]}",
+        "--reasoning-parser", "mimo", "--tool-call-parser", "mimo",
+        "--enable-auto-tool-choice", "--generation-config", "vllm",
+        "--attention-backend", "TRITON_ATTN", "--mm-encoder-attn-backend", "TRITON_ATTN",
+        "--moe-backend", "b12x", "--linear-backend", "deep_gemm",
+        "--max-cudagraph-capture-size", "64",
+        "--compilation-config", "{\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}",
+        "--speculative-config", "{\"method\":\"dflash\",\"model\":\"/model/dflash\",\"num_speculative_tokens\":7,\"draft_tensor_parallel_size\":8,\"max_model_len\":1048576,\"enable_adaptive_verification\":true}"
+      ],
+      "environment": {
+        "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7",
+        "VLLM_CACHE_ROOT": "/cache/mimo-v26-pro",
+        "VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN": "32768",
+        "VLLM_LOGGING_LEVEL": "INFO",
+        "VLLM_KV_CACHE_LAYOUT": "BLHNC",
+        "VLLM_ENABLE_PCIE_ALLREDUCE": "1",
+        "VLLM_PCIE_ALLREDUCE_BACKEND": "b12x",
+        "VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE": "64KB",
+        "B12X_TUNING_DEVICE_CLASS": "sm_120a-rtx-pro-6000",
+        "NCCL_IB_DISABLE": "1",
+        "NCCL_P2P_LEVEL": "SYS",
+        "NCCL_PROTO": "LL,LL128,Simple",
+        "CUTE_DSL_ARCH": "sm_120a"
+      },
+      "mounts": [
+        {"source": "/srv/fleet/models/MiMo-V2.6-Pro-RL", "target": "/model", "read_only": true},
+        {"source": "/srv/fleet/cache", "target": "/cache"}
+      ],
+      "placement": {"gpu_count": 8, "strategy": "pcie_affinity"},
+      "network_mode": "host",
+      "ipc": "private",
+      "shm_size": "32g",
+      "restart": "unless-stopped",
+      "init": true,
+      "ulimits": ["memlock=-1:-1", "stack=67108864:67108864"],
+      "readiness": {"url": "http://127.0.0.1:8109/health", "success_status": 200}
     }
   ]
 }

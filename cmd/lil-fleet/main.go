@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	manifestPath := flag.String("manifest", "fleet.json", "path to the immutable fleet manifest")
+	manifestPath := flag.String("manifest", "fleet.json", "path to the fleet manifest (watched for changes)")
 	tokenFile := flag.String("token-file", "", "path to a bearer token file protecting /v1 routes")
 	flag.Parse()
 
@@ -33,6 +33,19 @@ func main() {
 	driver := docker.NewCLIDriver(cfg.Runtime.DockerBinary)
 	manager := fleet.NewManager(cfg, driver, logger)
 	manager.Start()
+	defer manager.Close()
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go manifest.Watch(ctx, *manifestPath, time.Second, cfg, func(next *manifest.Manifest) error {
+		if err := manager.ReloadManifest(next); err != nil {
+			return err
+		}
+		logger.Info("reloaded fleet manifest", "manifest", *manifestPath, "models", len(next.Models))
+		return nil
+	}, func(err error) {
+		logger.Warn("manifest change not applied; retaining last valid configuration", "error", err)
+	})
 
 	handler := api.NewHandler(manager, logger)
 	var httpHandler http.Handler = handler
@@ -56,8 +69,6 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go func() {
 		<-ctx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -72,5 +83,4 @@ func main() {
 		logger.Error("serve HTTP", "error", err)
 		os.Exit(1)
 	}
-	manager.Close()
 }

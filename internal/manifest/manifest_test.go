@@ -217,8 +217,8 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(fleet.b12x.json) error = %v", err)
 	}
-	if len(cfg.Models) != 9 {
-		t.Fatalf("model count = %d, want 9", len(cfg.Models))
+	if len(cfg.Models) != 10 {
+		t.Fatalf("model count = %d, want 10", len(cfg.Models))
 	}
 	if !cfg.Runtime.ConcurrentDeployments {
 		t.Fatal("B12X manifest must enable concurrent deployments")
@@ -226,7 +226,7 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if cfg.Runtime.ModelPortRange == nil || cfg.Runtime.ModelPortRange.Start != 8101 || cfg.Runtime.ModelPortRange.End != 8109 {
 		t.Fatalf("B12X model port range = %+v, want 8101-8109", cfg.Runtime.ModelPortRange)
 	}
-	for _, id := range []string{"ds41-flash-tp4-ssd", "mimo-v26-flash-tp4"} {
+	for _, id := range []string{"ds41-flash-tp4-ssd", "mimo-v26-flash-tp4", "mimo-v26-pro-tp8"} {
 		t.Run(id+"/isolation", func(t *testing.T) {
 			model, ok := cfg.Model(id)
 			if !ok {
@@ -272,6 +272,90 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if !foundMMBackend {
 		t.Fatal("MiMo must use the Triton multimodal encoder backend")
 	}
+
+	pro, ok := cfg.Model("mimo-v26-pro-tp8")
+	if !ok {
+		t.Fatal("MiMo 2.6 Pro TP8 profile missing")
+	}
+	if pro.Image != mimo.Image {
+		t.Fatalf("MiMo Pro image = %q, want same Flash image %q", pro.Image, mimo.Image)
+	}
+	if pro.Placement == nil || pro.Placement.GPUCount != 8 || pro.Placement.Strategy != "pcie_affinity" {
+		t.Fatalf("MiMo Pro placement = %+v, want topology-aware TP8", pro.Placement)
+	}
+	if len(pro.Command) < 2 || pro.Command[0] != "serve" || pro.Command[1] != "/model" {
+		t.Fatalf("MiMo Pro command model path = %v, want serve /model", pro.Command)
+	}
+	if got := commandArgValue(t, pro.Command, "--served-model-name"); got != "MiMo-V2.6-Pro-RL" {
+		t.Fatalf("MiMo Pro served model = %q, want MiMo-V2.6-Pro-RL", got)
+	}
+	if got := commandArgValue(t, pro.Command, "--tensor-parallel-size"); got != "8" {
+		t.Fatalf("MiMo Pro tensor parallel size = %q, want 8", got)
+	}
+	if got := commandArgValue(t, pro.Command, "--safetensors-load-strategy"); got != "lazy" {
+		t.Fatalf("MiMo Pro safetensors load strategy = %q, want lazy", got)
+	}
+	if commandHasArg(pro.Command, "--load-format") {
+		t.Fatalf("MiMo Pro command must use the standard safetensors loader, not --load-format b12x: %v", pro.Command)
+	}
+	if got := commandArgValue(t, pro.Command, "--port"); got != "8109" || got != commandArgValue(t, mimo.Command, "--port") {
+		t.Fatalf("MiMo Pro port = %q and Flash port = %q, want shared 8109 guarded by TP8 full-GPU placement", got, commandArgValue(t, mimo.Command, "--port"))
+	}
+	if pro.Environment["CUDA_VISIBLE_DEVICES"] != "0,1,2,3,4,5,6,7" {
+		t.Fatalf("MiMo Pro CUDA_VISIBLE_DEVICES = %q, want all eight logical GPUs", pro.Environment["CUDA_VISIBLE_DEVICES"])
+	}
+	if len(pro.Mounts) == 0 || pro.Mounts[0].Source != "/srv/fleet/models/MiMo-V2.6-Pro-RL" || pro.Mounts[0].Target != "/model" || !pro.Mounts[0].ReadOnly {
+		t.Fatalf("MiMo Pro model mount = %+v, want read-only Pro checkpoint at /model", pro.Mounts)
+	}
+	speculative := speculativeConfig(t, pro)
+	if speculative["method"] != "dflash" {
+		t.Fatalf("MiMo Pro speculative method = %v, want dflash", speculative["method"])
+	}
+	if speculative["model"] != "/model/dflash" {
+		t.Fatalf("MiMo Pro draft path = %v, want /model/dflash under the Pro checkpoint mount", speculative["model"])
+	}
+	if speculative["model"] == "/opt/mimo-v26/dflash-fixed" {
+		t.Fatal("MiMo Pro must not use the image's baked Flash draft")
+	}
+	if speculative["num_speculative_tokens"] != float64(7) {
+		t.Fatalf("MiMo Pro speculative token count = %v, want 7", speculative["num_speculative_tokens"])
+	}
+	if speculative["draft_tensor_parallel_size"] != float64(8) {
+		t.Fatalf("MiMo Pro draft TP = %v, want TP8", speculative["draft_tensor_parallel_size"])
+	}
+}
+
+func commandArgValue(t *testing.T, command []string, name string) string {
+	t.Helper()
+	for index, argument := range command {
+		if argument == name && index+1 < len(command) {
+			return command[index+1]
+		}
+		if strings.HasPrefix(argument, name+"=") {
+			return strings.TrimPrefix(argument, name+"=")
+		}
+	}
+	t.Fatalf("command missing %s: %v", name, command)
+	return ""
+}
+
+func commandHasArg(command []string, name string) bool {
+	for _, argument := range command {
+		if argument == name || strings.HasPrefix(argument, name+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func speculativeConfig(t *testing.T, model Model) map[string]any {
+	t.Helper()
+	raw := commandArgValue(t, model.Command, "--speculative-config")
+	var config map[string]any
+	if err := json.Unmarshal([]byte(raw), &config); err != nil {
+		t.Fatalf("%s speculative config is not JSON: %v", model.ID, err)
+	}
+	return config
 }
 
 func TestDeepSeekSeccompOnlyAddsRequiredIOUringCalls(t *testing.T) {

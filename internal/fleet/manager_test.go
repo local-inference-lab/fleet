@@ -159,6 +159,47 @@ func TestConcurrentPlacementAllocatesAroundRunningDeployments(t *testing.T) {
 	}
 }
 
+func TestReloadManifestUpdatesConfiguredModels(t *testing.T) {
+	driver := newFakeDriver()
+	manager := newTestManager(t, driver)
+	next := loadFleetManifestForTest(t)
+	next.Models = []manifest.Model{
+		next.Models[1],
+		{ID: "gamma", Image: "gamma-image"},
+	}
+
+	if err := manager.ReloadManifest(next); err != nil {
+		t.Fatalf("ReloadManifest() error = %v", err)
+	}
+	models := manager.Models()
+	if got := []string{models[0].ID, models[1].ID}; !reflect.DeepEqual(got, []string{"beta", "gamma"}) {
+		t.Fatalf("models = %v, want beta and gamma", got)
+	}
+	if _, ok := manager.Status("alpha"); ok {
+		t.Fatal("removed unloaded model alpha still has a status")
+	}
+	status, ok := manager.Status("gamma")
+	if !ok || status.Phase != PhaseUnknown || status.Desired != "unloaded" {
+		t.Fatalf("new model status = (%+v, %v)", status, ok)
+	}
+}
+
+func TestReloadManifestRejectsChangesToActiveModel(t *testing.T) {
+	driver := newFakeDriver()
+	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running"}
+	manager := newTestManager(t, driver)
+	next := loadFleetManifestForTest(t)
+	next.Models[0].Image = "replacement-image"
+
+	err := manager.ReloadManifest(next)
+	if err == nil || !strings.Contains(err.Error(), "cannot be changed") {
+		t.Fatalf("ReloadManifest() error = %v, want active-model rejection", err)
+	}
+	if got := manager.Models()[0].Image; got != "alpha-image" {
+		t.Fatalf("active manifest image = %q, want retained alpha-image", got)
+	}
+}
+
 func newTestManager(t *testing.T, driver *fakeDriver) *Manager {
 	t.Helper()
 	cfg := loadFleetManifestForTest(t)

@@ -2,7 +2,7 @@
 
 `lil-fleet` is a small Docker control plane for switching between a fixed set of local inference deployments. It follows the Local Inference Lab pattern: model and hardware tuning belongs to declarative deployment configuration; the API only chooses a configured profile, loads it, unloads it, and reports its state.
 
-The service intentionally has no endpoint for changing images, commands, environment variables, mounts, ports, GPU allocation, shared memory, IPC, or readiness checks. Those values are loaded once from a strict JSON manifest at startup. Unknown manifest and API fields are rejected.
+The service intentionally has no endpoint for changing images, commands, environment variables, mounts, ports, GPU allocation, shared memory, IPC, or readiness checks. Those values come from a strict JSON manifest that Fleet watches and reloads. Unknown manifest and API fields are rejected.
 
 ## Run it
 
@@ -92,11 +92,15 @@ DeepSeek uses disk-backed Engram tables. Qwen Flash Next TP2/TP3 use disk-backed
 
 The `mimo-v26-flash-tp4` profile serves `XiaomiMiMo/MiMo-V2.6-Flash-RL` from the example path `/srv/fleet/models/MiMo-V2.6-Flash-RL` with DFlash speculative decoding. Its TP4 placement takes one complete PCIe group, depending on availability; the fixed `CUDA_VISIBLE_DEVICES=0,1,2,3` refers to the four logical devices exposed inside the allocated container. For groups mixing Max-Q and standard RTX PRO 6000 cards, the model-specific image adds an opt-in `B12X_TUNING_DEVICE_CLASS` identity. This lets B12X agree on one SM120A tuning selection across ranks while leaving its executable caches bound to each physical GPU. The multimodal encoder uses Triton attention explicitly for compatibility with drivers that cannot execute the image's newer FlashAttention PTX.
 
+The `mimo-v26-pro-tp8` profile serves `XiaomiMiMo/MiMo-V2.6-Pro-RL` across all eight GPUs while reusing the MiMo Flash B12X image. Download the official Pro checkpoint at revision `73875d00b30a89ef8cc353a0b60b0e9f9561952d` into `/srv/fleet/models/MiMo-V2.6-Pro-RL`, and keep the DFlash draft under that same checkpoint at `/srv/fleet/models/MiMo-V2.6-Pro-RL/dflash` so the container sees it as `/model/dflash`. The Pro profile shares port `8109` with Flash only because TP8 reserves every GPU and cannot run concurrently with the TP4 Flash profile; do not reuse a host port for profiles that Fleet can co-schedule.
+
+Pro intentionally uses vLLM's standard lazy safetensors loader because this image's B12X direct loader rejects Pro audio-encoder weights. B12X remains the execution backend for collectives and kernels.
+
 The main image is the current Karmic release with B12X pinned from source. The true-TP6 GLM profile is an explicit compatibility exception: it pins the documented Eldritch head-padding runtime (including its matching bundled B12X), because current B12X cannot be overlaid on that older vLLM API and the current Karmic runtime has dropped the virtual-TP padding layer.
 
 ### DeepSeek and MiMo isolation
 
-These two TP4 profiles use private IPC namespaces with 32 GiB of `/dev/shm`;
+The DeepSeek and MiMo profiles use private IPC namespaces with 32 GiB of `/dev/shm`;
 their workers share memory within the container without joining host IPC. MiMo
 uses Docker's default seccomp filter. DeepSeek's disk-backed Engram reader needs
 `io_uring_setup`, `io_uring_enter`, and `io_uring_register`, so it uses
@@ -143,7 +147,7 @@ Full schemas are in [`openapi.yaml`](openapi.yaml).
 
 ## Manifest boundary
 
-`fleet.json` is the administrative interface. The API never writes or reloads it. Restart the controller after a reviewed manifest change. The file supports:
+`fleet.json` is the administrative interface. The API never writes it. Fleet checks the file once per second and atomically applies each valid change while retaining the last valid configuration if a write is incomplete or invalid. Model additions and changes to unloaded models are live; removing or changing an active model is retried after that model is unloaded. Changes to `api.listen` or `runtime.docker_binary` still require a controller restart. The file supports:
 
 - controller listen address and Docker binary;
 - reconciliation, command, and readiness timeouts;
@@ -154,7 +158,7 @@ Full schemas are in [`openapi.yaml`](openapi.yaml).
 - environment, bind mounts, ports, static GPU request or topology-aware placement, entrypoint, network/IPC mode, security options, ulimits, and shared memory;
 - an optional HTTP readiness probe.
 
-Exclusive profiles may share a host inference port. Concurrent profiles must use distinct ports, as the B12X fleet manifest does. The B12X manifest restricts model listeners to `8101` through `8109`; keep the surrounding host and container firewall rules synchronized with that range.
+Exclusive profiles may share a host inference port. Profiles that Fleet can co-schedule must use distinct ports; the B12X Pro profile may share Flash's port only because it reserves all eight GPUs. The B12X manifest restricts model listeners to `8101` through `8109`; keep the surrounding host and container firewall rules synchronized with that range.
 
 Environment and commands are deliberately omitted from API responses so secrets and privileged launch arguments do not leak. Docker commands use direct argument execution rather than a shell, and model IDs are validated before they can contribute to deterministic container names.
 

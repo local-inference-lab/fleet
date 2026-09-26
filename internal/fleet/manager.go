@@ -256,6 +256,7 @@ func (m *Manager) Activate(modelID string) (Operation, bool, error) {
 		devices, err := m.gpus.Snapshot(context.Background())
 		if err != nil {
 			m.mu.Unlock()
+			m.logger.Error("model load failed", "model_id", modelID, "error", err)
 			return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
 		}
 		allocator := gpu.Allocator{Topology: gpu.Topology{
@@ -275,6 +276,7 @@ func (m *Manager) Activate(modelID string) (Operation, bool, error) {
 		assignedGPUs, err = allocator.Allocate(devices, model.Placement.GPUCount, reserved)
 		if err != nil {
 			m.mu.Unlock()
+			m.logger.Error("model load failed", "model_id", modelID, "error", err)
 			return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
 		}
 		status := m.statuses[modelID]
@@ -357,9 +359,23 @@ func (m *Manager) beginOperation(id string) {
 }
 
 func (m *Manager) finishOperation(id string, err error) {
+	m.mu.RLock()
+	op := m.operations[id]
+	m.mu.RUnlock()
+	if err != nil {
+		if op.Kind == "unload" {
+			m.logger.Error("model unload failed", "model_id", op.ModelID, "operation_id", id, "error", err)
+		} else {
+			m.logger.Error("model load failed", "model_id", op.ModelID, "operation_id", id, "error", err)
+		}
+	} else if op.Kind == "unload" {
+		m.logger.Info("model unloaded", "model_id", op.ModelID, "operation_id", id)
+	} else {
+		m.logger.Info("model loaded", "model_id", op.ModelID, "operation_id", id)
+	}
+
 	now := time.Now().UTC()
 	m.mu.Lock()
-	op := m.operations[id]
 	op.State = "succeeded"
 	if err != nil {
 		op.State = "failed"
@@ -384,16 +400,21 @@ func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model 
 			if other.ID == modelID {
 				continue
 			}
+			wasLoaded := m.currentStatus(other.ID).Phase != PhaseUnloaded
 			m.updateTransition(other.ID, PhaseStopping, "unloaded")
 			opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
 			err := m.driver.Stop(opCtx, other, cfg.Runtime.RemoveOnUnload)
 			opCancel()
 			if err != nil {
 				m.setFailure(other.ID, err)
+				m.logger.Error("model unload failed", "model_id", other.ID, "operation_id", operationID, "error", err)
 				m.finishOperation(operationID, fmt.Errorf("unload %s before switch: %w", other.ID, err))
 				return
 			}
 			m.setUnloaded(other.ID)
+			if wasLoaded {
+				m.logger.Info("model unloaded", "model_id", other.ID, "operation_id", operationID)
+			}
 		}
 	}
 

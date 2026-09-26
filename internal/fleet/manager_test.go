@@ -1,7 +1,9 @@
 package fleet
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -46,6 +48,101 @@ func TestActivateUnloadsOtherModelsBeforeStartingTarget(t *testing.T) {
 	}
 	if status, _ := manager.Status("beta"); status.Phase != PhaseReady || status.Desired != "ready" {
 		t.Fatalf("beta status = %+v", status)
+	}
+}
+
+func TestLifecycleLogsCompletedOperations(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		model     string
+		operation string
+		initial   bool
+		startErr  error
+		stopErr   error
+		wantState string
+		wantLogs  []string
+	}{
+		{"load", "alpha", "activate", false, nil, nil, "succeeded", []string{"model loaded:alpha:INFO"}},
+		{"unload", "alpha", "unload", true, nil, nil, "succeeded", []string{"model unloaded:alpha:INFO"}},
+		{"load failure", "alpha", "activate", false, errors.New("start failed"), nil, "failed", []string{"model load failed:alpha:ERROR"}},
+		{"unload failure", "alpha", "unload", true, nil, errors.New("stop failed"), "failed", []string{"model unload failed:alpha:ERROR"}},
+		{"switch", "beta", "activate", true, nil, nil, "succeeded", []string{"model unloaded:alpha:INFO", "model loaded:beta:INFO"}},
+		{"switch unload failure", "beta", "activate", true, nil, errors.New("stop failed"), "failed", []string{"model unload failed:alpha:ERROR", "model load failed:beta:ERROR"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driver := newFakeDriver()
+			if tc.initial {
+				driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running"}
+			}
+			driver.startErr = tc.startErr
+			driver.stopErr = tc.stopErr
+			manager := newTestManager(t, driver)
+			var output bytes.Buffer
+			manager.logger = slog.New(slog.NewJSONHandler(&output, nil))
+
+			var op Operation
+			var err error
+			if tc.operation == "unload" {
+				op, _, err = manager.Unload(tc.model)
+			} else {
+				op, _, err = manager.Activate(tc.model)
+			}
+			if err != nil {
+				t.Fatalf("%s(%s): %v", tc.operation, tc.model, err)
+			}
+			waitOperation(t, manager, op.ID, tc.wantState)
+
+			decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+			var logs []string
+			for decoder.More() {
+				var record struct {
+					Level       string `json:"level"`
+					Message     string `json:"msg"`
+					ModelID     string `json:"model_id"`
+					OperationID string `json:"operation_id"`
+					Error       string `json:"error"`
+				}
+				if err := decoder.Decode(&record); err != nil {
+					t.Fatalf("decode log: %v", err)
+				}
+				if record.OperationID != op.ID {
+					t.Fatalf("log operation ID = %q, want %q", record.OperationID, op.ID)
+				}
+				if record.Level == "ERROR" && record.Error == "" {
+					t.Fatalf("failure log has no error: %+v", record)
+				}
+				logs = append(logs, record.Message+":"+record.ModelID+":"+record.Level)
+			}
+			if !reflect.DeepEqual(logs, tc.wantLogs) {
+				t.Fatalf("logs = %v, want %v", logs, tc.wantLogs)
+			}
+		})
+	}
+}
+
+func TestLifecycleLogsLoadResourceFailure(t *testing.T) {
+	manager := newTestManager(t, newFakeDriver())
+	manager.manifest.Models[0].Placement = &manifest.Placement{GPUCount: 1, Strategy: "pcie_affinity"}
+	manager.gpus = fakeGPUProvider{}
+	var output bytes.Buffer
+	manager.logger = slog.New(slog.NewJSONHandler(&output, nil))
+
+	_, _, err := manager.Activate("alpha")
+	var insufficient *InsufficientResourcesError
+	if !errors.As(err, &insufficient) {
+		t.Fatalf("Activate() error = %v, want insufficient resources", err)
+	}
+	var record struct {
+		Level   string `json:"level"`
+		Message string `json:"msg"`
+		ModelID string `json:"model_id"`
+		Error   string `json:"error"`
+	}
+	if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+		t.Fatalf("decode log: %v", err)
+	}
+	if record.Level != "ERROR" || record.Message != "model load failed" || record.ModelID != "alpha" || record.Error == "" {
+		t.Fatalf("resource failure log = %+v", record)
 	}
 }
 
@@ -265,6 +362,8 @@ type fakeDriver struct {
 	states     map[string]deployment.ContainerState
 	calls      []string
 	blockStart chan struct{}
+	startErr   error
+	stopErr    error
 }
 
 func newFakeDriver() *fakeDriver {
@@ -282,6 +381,9 @@ func (d *fakeDriver) Start(ctx context.Context, model manifest.Model, assigned [
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.calls = append(d.calls, "start:"+model.ID)
+	if d.startErr != nil {
+		return d.startErr
+	}
 	d.states[model.ID] = deployment.ContainerState{Exists: true, Running: true, Status: "running", AssignedGPUs: assigned}
 	return nil
 }
@@ -290,6 +392,9 @@ func (d *fakeDriver) Stop(ctx context.Context, model manifest.Model, remove bool
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.calls = append(d.calls, "stop:"+model.ID+":"+strconv.FormatBool(remove))
+	if d.stopErr != nil {
+		return d.stopErr
+	}
 	delete(d.states, model.ID)
 	return nil
 }

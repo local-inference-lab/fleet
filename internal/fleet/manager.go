@@ -34,6 +34,7 @@ type ModelInfo struct {
 	ID          string `json:"id"`
 	Description string `json:"description,omitempty"`
 	Image       string `json:"image"`
+	GPUCount    int    `json:"gpu_count,omitempty"`
 }
 
 type Status struct {
@@ -144,7 +145,11 @@ func (m *Manager) Models() []ModelInfo {
 	defer m.mu.RUnlock()
 	models := make([]ModelInfo, 0, len(m.manifest.Models))
 	for _, model := range m.manifest.Models {
-		models = append(models, ModelInfo{ID: model.ID, Description: model.Description, Image: model.Image})
+		gpuCount := 0
+		if model.Placement != nil {
+			gpuCount = model.Placement.GPUCount
+		}
+		models = append(models, ModelInfo{ID: model.ID, Description: model.Description, Image: model.Image, GPUCount: gpuCount})
 	}
 	return models
 }
@@ -486,6 +491,12 @@ func (m *Manager) refresh(ctx context.Context) {
 		}
 		current := m.statuses[model.ID]
 		m.mu.RUnlock()
+		// On restart, recover intent from an existing running container. Unknown
+		// also covers a failed first inspection; explicit stopping intent stays intact.
+		if current.Phase == PhaseUnknown && current.Desired == "unloaded" &&
+			(status.Phase == PhaseReady || status.Phase == PhaseUnhealthy) {
+			status.Desired = "ready"
+		}
 		if current.Phase == PhaseLoading && status.Phase != PhaseReady && status.Phase != PhaseFailed {
 			status.Phase = PhaseLoading
 			status.Desired = "ready"

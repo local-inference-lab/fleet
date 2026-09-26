@@ -73,7 +73,10 @@ type Model struct {
 	Ulimits     []string          `json:"ulimits,omitempty"`
 	Restart     string            `json:"restart,omitempty"`
 	Init        bool              `json:"init,omitempty"`
+	Privileged  bool              `json:"privileged,omitempty"`
+	StopTimeout string            `json:"stop_timeout,omitempty"`
 	Readiness   *Readiness        `json:"readiness,omitempty"`
+	stopTimeout time.Duration
 }
 
 type Placement struct {
@@ -200,6 +203,12 @@ func (m *Manifest) validate() error {
 		}
 		if model.Restart != "" && !validRestartPolicy.MatchString(model.Restart) {
 			return fmt.Errorf("model %q: invalid restart policy %q", model.ID, model.Restart)
+		}
+		if model.StopTimeout != "" {
+			model.stopTimeout, err = parseStopTimeout(model.StopTimeout)
+			if err != nil {
+				return fmt.Errorf("model %q: stop_timeout: %w", model.ID, err)
+			}
 		}
 		if model.Placement != nil {
 			if !m.Runtime.ConcurrentDeployments {
@@ -346,9 +355,35 @@ func durationOrDefault(value string, fallback time.Duration) (time.Duration, err
 	return d, nil
 }
 
+func parseStopTimeout(value string) (time.Duration, error) {
+	d, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, err
+	}
+	if d < time.Second {
+		return 0, errors.New("must be at least 1s")
+	}
+	if d%time.Second != 0 {
+		return 0, errors.New("must be a whole number of seconds")
+	}
+	return d, nil
+}
+
 func (r RuntimeConfig) PollDuration() time.Duration      { return r.pollInterval }
 func (r RuntimeConfig) OperationDuration() time.Duration { return r.operationTimeout }
 func (r RuntimeConfig) ReadinessDuration() time.Duration { return r.readinessTimeout }
+
+func (m Model) StopTimeoutSeconds() int {
+	d := m.stopTimeout
+	if d == 0 && m.StopTimeout != "" {
+		var err error
+		d, err = parseStopTimeout(m.StopTimeout)
+		if err != nil {
+			return 0
+		}
+	}
+	return int(d / time.Second)
+}
 
 func (m *Manifest) Model(id string) (Model, bool) {
 	for _, model := range m.Models {

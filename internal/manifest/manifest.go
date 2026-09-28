@@ -17,6 +17,7 @@ import (
 
 var (
 	validID            = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
+	reservedReplicaID  = regexp.MustCompile(`--([2-9]|[1-5][0-9]|6[0-4])$`)
 	validRestartPolicy = regexp.MustCompile(`^(no|always|unless-stopped|on-failure(:[1-9][0-9]*)?)$`)
 )
 
@@ -77,6 +78,11 @@ type Model struct {
 	StopTimeout string            `json:"stop_timeout,omitempty"`
 	Readiness   *Readiness        `json:"readiness,omitempty"`
 	stopTimeout time.Duration
+
+	InstanceProfileID string `json:"-"`
+	InstanceID        string `json:"-"`
+	InstanceIndex     int    `json:"-"`
+	InstancePort      int    `json:"-"`
 }
 
 type Placement struct {
@@ -193,6 +199,9 @@ func (m *Manifest) validate() error {
 		model := &m.Models[i]
 		if !validID.MatchString(model.ID) {
 			return fmt.Errorf("models[%d].id %q must match %s", i, model.ID, validID)
+		}
+		if reservedReplicaID.MatchString(model.ID) {
+			return fmt.Errorf("models[%d].id %q uses the reserved replica suffix namespace", i, model.ID)
 		}
 		if _, ok := seen[model.ID]; ok {
 			return fmt.Errorf("duplicate model id %q", model.ID)

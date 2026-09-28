@@ -220,6 +220,55 @@ func TestRefreshMonitorsHealthAndReadiness(t *testing.T) {
 	}
 }
 
+func TestRefreshAdoptsRunningContainersAfterRestart(t *testing.T) {
+	for _, health := range []string{"healthy", "unhealthy"} {
+		t.Run(health, func(t *testing.T) {
+			driver := newFakeDriver()
+			driver.states["alpha"] = deployment.ContainerState{
+				Exists: true, Running: true, Status: "running", Health: health, AssignedGPUs: []int{0, 1},
+			}
+			manager := newTestManager(t, driver)
+			status, _ := manager.Status("alpha")
+			if status.Desired != "ready" || !reflect.DeepEqual(status.AssignedGPUs, []int{0, 1}) {
+				t.Fatalf("recovered container status = %+v", status)
+			}
+			if missing, _ := manager.Status("beta"); missing.Desired != "unloaded" {
+				t.Fatalf("missing container status = %+v", missing)
+			}
+			for _, call := range driver.calls {
+				if !strings.HasPrefix(call, "inspect:") {
+					t.Fatalf("discovery mutated a container: %s", call)
+				}
+			}
+		})
+	}
+}
+
+func TestRefreshAdoptsRunningContainerAfterInitialInspectError(t *testing.T) {
+	driver := newFakeDriver()
+	driver.inspectErr = errors.New("temporary inspection failure")
+	manager := newTestManager(t, driver)
+	driver.inspectErr = nil
+	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running"}
+	manager.refresh(context.Background())
+	status, _ := manager.Status("alpha")
+	if status.Phase != PhaseReady || status.Desired != "ready" {
+		t.Fatalf("recovered container status = %+v", status)
+	}
+}
+
+func TestRefreshPreservesExplicitUnloadIntent(t *testing.T) {
+	driver := newFakeDriver()
+	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running"}
+	manager := newTestManager(t, driver)
+	manager.updateTransition("alpha", PhaseStopping, "unloaded")
+	manager.refresh(context.Background())
+	status, _ := manager.Status("alpha")
+	if status.Phase != PhaseStopping || status.Desired != "unloaded" {
+		t.Fatalf("unload intent was overwritten: %+v", status)
+	}
+}
+
 func TestConcurrentPlacementAllocatesAroundRunningDeployments(t *testing.T) {
 	driver := newFakeDriver()
 	manager := newTestManager(t, driver)
@@ -256,6 +305,316 @@ func TestConcurrentPlacementAllocatesAroundRunningDeployments(t *testing.T) {
 	}
 }
 
+func TestActivateInstancesScalesReplicasAndKeepsGPUAndPortsDisjoint(t *testing.T) {
+	driver := newFakeDriver()
+	manager := newReplicaTestManager(t, driver)
+
+	target := 2
+	op, noOp, err := manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 2) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+
+	status, _ := manager.Status("alpha")
+	if status.ReadyInstances != 2 || status.DesiredInstances != 2 || status.Phase != PhaseReady {
+		t.Fatalf("status after scale up = %+v", status)
+	}
+	if got := []string{status.Instances[0].InstanceID, status.Instances[1].InstanceID}; !reflect.DeepEqual(got, []string{"alpha", "alpha--2"}) {
+		t.Fatalf("instance IDs = %v", got)
+	}
+	if got := []int{status.Instances[0].Port, status.Instances[1].Port}; !reflect.DeepEqual(got, []int{9001, 9002}) {
+		t.Fatalf("ports = %v", got)
+	}
+	if reflect.DeepEqual(status.Instances[0].AssignedGPUs, status.Instances[1].AssignedGPUs) {
+		t.Fatalf("replicas used overlapping GPU assignment: %+v", status.Instances)
+	}
+
+	target = 1
+	op, noOp, err = manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 1) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+	status, _ = manager.Status("alpha")
+	if status.ReadyInstances != 1 || len(status.Instances) != 1 || status.Instances[0].InstanceID != "alpha" {
+		t.Fatalf("status after scale down = %+v", status)
+	}
+	driver.mu.Lock()
+	_, extraExists := driver.states["alpha--2"]
+	driver.mu.Unlock()
+	if extraExists {
+		t.Fatal("scaled down instance alpha--2 still exists")
+	}
+}
+
+func TestActivateInstancesScaleDownStopFailureRetainsReplicaGPUReservation(t *testing.T) {
+	driver := newFakeDriver()
+	manager := newReplicaTestManager(t, driver)
+	manager.manifest.Runtime.GPUTopology.Groups = [][]int{{0}, {1}}
+	manager.gpus = fakeGPUProvider{devices: []gpu.Device{
+		{Index: 0, MemoryUsedMiB: 0},
+		{Index: 1, MemoryUsedMiB: 0},
+	}}
+	manager.manifest.Models[1].Placement = &manifest.Placement{GPUCount: 1, Strategy: "pcie_affinity"}
+	manager.manifest.Models[1].Command = []string{"serve", "--host", "0.0.0.0", "--port", "9003"}
+	manager.manifest.Models[1].Readiness = &manifest.Readiness{URL: "http://127.0.0.1:9003/health", SuccessStatus: 200}
+
+	target := 2
+	op, noOp, err := manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 2) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+	before, _ := manager.Status("alpha")
+	if before.ReadyInstances != 2 || len(before.Instances) != 2 {
+		t.Fatalf("status after scale up = %+v", before)
+	}
+	stoppedReplicaGPUs := append([]int(nil), before.Instances[1].AssignedGPUs...)
+
+	driver.stopErr = errors.New("stop failed")
+	target = 1
+	op, noOp, err = manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 1) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "failed")
+
+	status, _ := manager.Status("alpha")
+	if status.Instances[0].InstanceID != "alpha" || status.Instances[0].Phase != PhaseReady || !reflect.DeepEqual(status.Instances[0].AssignedGPUs, before.Instances[0].AssignedGPUs) {
+		t.Fatalf("healthy sibling not preserved after stop failure: before=%+v after=%+v", before, status)
+	}
+	if len(status.Instances) != 2 || status.Instances[1].InstanceID != "alpha--2" || !reflect.DeepEqual(status.Instances[1].AssignedGPUs, stoppedReplicaGPUs) {
+		t.Fatalf("stopping replica GPU metadata lost after stop failure: before=%+v after=%+v", before, status)
+	}
+
+	_, _, err = manager.Activate("beta")
+	var insufficient *InsufficientResourcesError
+	if !errors.As(err, &insufficient) {
+		t.Fatalf("Activate(beta) error = %v, want insufficient resources from retained alpha reservations", err)
+	}
+}
+
+func TestActivateInstancesScaleUpReservesExistingReplicaGPU(t *testing.T) {
+	driver := newFakeDriver()
+	manager := newReplicaTestManager(t, driver)
+	target := 1
+	op, noOp, err := manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 1) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+	first, _ := manager.Status("alpha")
+	if len(first.Instances) != 1 {
+		t.Fatalf("initial status = %+v", first)
+	}
+
+	target = 2
+	op, noOp, err = manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 2) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+	status, _ := manager.Status("alpha")
+	if reflect.DeepEqual(status.Instances[0].AssignedGPUs, status.Instances[1].AssignedGPUs) {
+		t.Fatalf("scale-up reused existing GPU: before=%+v after=%+v", first, status)
+	}
+}
+
+func TestActivateInstancesDedupesIdenticalExplicitInFlightRequest(t *testing.T) {
+	driver := newFakeDriver()
+	driver.blockStart = make(chan struct{})
+	manager := newReplicaTestManager(t, driver)
+	target := 2
+	op, noOp, err := manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 2) = (%+v, %v, %v)", op, noOp, err)
+	}
+	same, sameNoOp, err := manager.ActivateInstances("alpha", &target)
+	if err != nil {
+		t.Fatalf("second ActivateInstances(alpha, 2) error = %v", err)
+	}
+	if !sameNoOp || same.ID != op.ID {
+		t.Fatalf("second ActivateInstances(alpha, 2) = (%+v, %v), want same op", same, sameNoOp)
+	}
+	close(driver.blockStart)
+	waitOperation(t, manager, op.ID, "succeeded")
+}
+
+func TestActivateInstancesInsufficientResourcesDoesNotMutateExistingInstances(t *testing.T) {
+	driver := newFakeDriver()
+	manager := newReplicaTestManager(t, driver)
+	target := 2
+	op, noOp, err := manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 2) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+	before, _ := manager.Status("alpha")
+
+	target = 4
+	_, _, err = manager.ActivateInstances("alpha", &target)
+	var insufficient *InsufficientResourcesError
+	if !errors.As(err, &insufficient) {
+		t.Fatalf("ActivateInstances(alpha, 4) error = %v, want insufficient resources", err)
+	}
+	after, _ := manager.Status("alpha")
+	if !reflect.DeepEqual(before.Instances, after.Instances) || after.ReadyInstances != before.ReadyInstances {
+		t.Fatalf("status mutated after failed preflight:\nbefore=%+v\nafter=%+v", before, after)
+	}
+}
+
+func TestActivateInstancesTP4ReplicasUseDisjointGPUSets(t *testing.T) {
+	driver := newFakeDriver()
+	manager := newReplicaTestManager(t, driver)
+	manager.manifest.Runtime.ModelPortRange = &manifest.PortRange{Start: 9001, End: 9002}
+	manager.manifest.Runtime.GPUTopology.Groups = [][]int{{0, 1, 6, 7}, {2, 3, 4, 5}}
+	manager.manifest.Models[0].Placement = &manifest.Placement{GPUCount: 4, Strategy: "pcie_affinity"}
+	manager.gpus = fakeGPUProvider{devices: []gpu.Device{
+		{Index: 0, MemoryUsedMiB: 0}, {Index: 1, MemoryUsedMiB: 0},
+		{Index: 2, MemoryUsedMiB: 0}, {Index: 3, MemoryUsedMiB: 0},
+		{Index: 4, MemoryUsedMiB: 0}, {Index: 5, MemoryUsedMiB: 0},
+		{Index: 6, MemoryUsedMiB: 0}, {Index: 7, MemoryUsedMiB: 0},
+	}}
+	target := 2
+	op, noOp, err := manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 2) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+	status, _ := manager.Status("alpha")
+	if intersects(status.Instances[0].AssignedGPUs, status.Instances[1].AssignedGPUs) {
+		t.Fatalf("TP4 replicas overlap GPUs: %+v", status.Instances)
+	}
+}
+
+func TestActivateSwitchIgnoresOtherModelGPUsOnlyWhenConcurrentDeploymentsDisabled(t *testing.T) {
+	driver := newFakeDriver()
+	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running", AssignedGPUs: []int{0, 1, 2, 3}}
+	manager := newTestManager(t, driver)
+	manager.manifest.Runtime.ConcurrentDeployments = false
+	manager.manifest.Runtime.GPUTopology.Groups = [][]int{{0, 1, 2, 3}}
+	manager.manifest.Models[1].Placement = &manifest.Placement{GPUCount: 4, Strategy: "pcie_affinity"}
+	manager.gpus = fakeGPUProvider{devices: []gpu.Device{
+		{Index: 0, MemoryUsedMiB: 0}, {Index: 1, MemoryUsedMiB: 0},
+		{Index: 2, MemoryUsedMiB: 0}, {Index: 3, MemoryUsedMiB: 0},
+	}}
+
+	op, noOp, err := manager.Activate("beta")
+	if err != nil || noOp {
+		t.Fatalf("Activate(beta) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+}
+
+func TestActivateRestartsStoppedFailedBaseInstance(t *testing.T) {
+	driver := newFakeDriver()
+	driver.states["alpha"] = deployment.ContainerState{
+		Exists: true, Running: false, Status: "exited", ExitCode: 1, Port: 9001, AssignedGPUs: []int{0},
+	}
+	manager := newReplicaTestManager(t, driver)
+	status, _ := manager.Status("alpha")
+	if status.Phase != PhaseFailed {
+		t.Fatalf("initial status = %+v, want failed", status)
+	}
+
+	op, noOp, err := manager.Activate("alpha")
+	if err != nil || noOp {
+		t.Fatalf("Activate(alpha) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+	status, _ = manager.Status("alpha")
+	if status.Phase != PhaseReady || status.ReadyInstances != 1 || status.Instances[0].Port != 9001 {
+		t.Fatalf("restarted status = %+v", status)
+	}
+}
+
+func TestActivateRepairsFailedReplicaWithoutRestartingHealthySibling(t *testing.T) {
+	driver := newFakeDriver()
+	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running", Port: 9001, AssignedGPUs: []int{0}}
+	driver.states["alpha--2"] = deployment.ContainerState{
+		Exists: true, Running: false, Status: "exited", ExitCode: 1, Port: 9002, AssignedGPUs: []int{1},
+	}
+	manager := newReplicaTestManager(t, driver)
+	target := 2
+	op, noOp, err := manager.ActivateInstances("alpha", &target)
+	if err != nil || noOp {
+		t.Fatalf("ActivateInstances(alpha, 2) = (%+v, %v, %v)", op, noOp, err)
+	}
+	waitOperation(t, manager, op.ID, "succeeded")
+
+	driver.mu.Lock()
+	calls := append([]string(nil), driver.calls...)
+	driver.mu.Unlock()
+	startAlpha := 0
+	startReplica := 0
+	for _, call := range calls {
+		if call == "start:alpha" {
+			startAlpha++
+		}
+		if call == "start:alpha--2" {
+			startReplica++
+		}
+	}
+	if startAlpha != 0 || startReplica != 1 {
+		t.Fatalf("start calls alpha=%d alpha--2=%d, calls=%v", startAlpha, startReplica, calls)
+	}
+	status, _ := manager.Status("alpha")
+	if status.Phase != PhaseReady || status.ReadyInstances != 2 || status.Instances[1].Port != 9002 {
+		t.Fatalf("repaired status = %+v", status)
+	}
+}
+
+func TestRefreshRecoversReplicaContainersAfterRestart(t *testing.T) {
+	driver := newFakeDriver()
+	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running", Port: 9001, AssignedGPUs: []int{0}}
+	driver.states["alpha--2"] = deployment.ContainerState{Exists: true, Running: true, Status: "running", Port: 9002, AssignedGPUs: []int{1}}
+	manager := newReplicaTestManager(t, driver)
+
+	status, _ := manager.Status("alpha")
+	if status.Desired != "ready" || status.ReadyInstances != 2 || len(status.Instances) != 2 {
+		t.Fatalf("recovered replica status = %+v", status)
+	}
+	if got := []int{status.Instances[0].Port, status.Instances[1].Port}; !reflect.DeepEqual(got, []int{9001, 9002}) {
+		t.Fatalf("recovered ports = %v", got)
+	}
+}
+
+func TestReloadManifestRejectsActiveReplicaPortCollision(t *testing.T) {
+	driver := newFakeDriver()
+	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running", Port: 9001, AssignedGPUs: []int{0}}
+	driver.states["alpha--2"] = deployment.ContainerState{Exists: true, Running: true, Status: "running", Port: 9002, AssignedGPUs: []int{1}}
+	manager := newReplicaTestManager(t, driver)
+	next := loadFleetManifestForTest(t)
+	next.Runtime.ConcurrentDeployments = true
+	next.Runtime.ModelPortRange = &manifest.PortRange{Start: 9001, End: 9003}
+	next.Runtime.GPUTopology.Groups = [][]int{{0, 1}, {2, 3}}
+	next.Models[0] = manager.manifest.Models[0]
+	next.Models[1].Command = []string{"serve", "--port", "9002"}
+	next.Models[1].Readiness = &manifest.Readiness{URL: "http://127.0.0.1:9002/health", SuccessStatus: 200}
+
+	err := manager.ReloadManifest(next)
+	if err == nil || !strings.Contains(err.Error(), "collides") {
+		t.Fatalf("ReloadManifest() error = %v, want port collision", err)
+	}
+}
+
+func TestReloadManifestRejectsMixedReadyFailedActiveModelChange(t *testing.T) {
+	driver := newFakeDriver()
+	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running", Port: 9001, AssignedGPUs: []int{0}}
+	driver.states["alpha--2"] = deployment.ContainerState{Exists: true, Running: false, Status: "exited", ExitCode: 1, Port: 9002, AssignedGPUs: []int{1}}
+	manager := newReplicaTestManager(t, driver)
+	next := loadFleetManifestForTest(t)
+	next.Runtime = manager.manifest.Runtime
+	next.Models = append([]manifest.Model(nil), manager.manifest.Models...)
+	next.Models[0].Image = "replacement"
+
+	err := manager.ReloadManifest(next)
+	if err == nil || !strings.Contains(err.Error(), "cannot be changed") {
+		t.Fatalf("ReloadManifest() error = %v, want active-model rejection", err)
+	}
+}
+
 func TestReloadManifestUpdatesConfiguredModels(t *testing.T) {
 	driver := newFakeDriver()
 	manager := newTestManager(t, driver)
@@ -281,6 +640,14 @@ func TestReloadManifestUpdatesConfiguredModels(t *testing.T) {
 	}
 }
 
+func TestModelsExposeConfiguredGPUCount(t *testing.T) {
+	manager := newTestManager(t, newFakeDriver())
+	manager.manifest.Models[0].Placement = &manifest.Placement{GPUCount: 4, Strategy: "pcie_affinity"}
+	if got := manager.Models()[0].GPUCount; got != 4 {
+		t.Fatalf("GPUCount = %d, want 4", got)
+	}
+}
+
 func TestReloadManifestRejectsChangesToActiveModel(t *testing.T) {
 	driver := newFakeDriver()
 	driver.states["alpha"] = deployment.ContainerState{Exists: true, Running: true, Status: "running"}
@@ -301,6 +668,34 @@ func newTestManager(t *testing.T, driver *fakeDriver) *Manager {
 	t.Helper()
 	cfg := loadFleetManifestForTest(t)
 	m := NewManager(cfg, driver, slog.Default())
+	m.refresh(context.Background())
+	return m
+}
+
+func newReplicaTestManager(t *testing.T, driver *fakeDriver) *Manager {
+	t.Helper()
+	cfg := loadFleetManifestForTest(t)
+	cfg.Runtime.ConcurrentDeployments = true
+	cfg.Runtime.ModelPortRange = &manifest.PortRange{Start: 9001, End: 9003}
+	cfg.Runtime.GPUTopology.Groups = [][]int{{0, 1}, {2, 3}}
+	cfg.Runtime.GPUTopology.MaxUsedMemoryMiB = 1024
+	cfg.Models[0].Command = []string{"serve", "--host", "0.0.0.0", "--port", "9001"}
+	cfg.Models[0].Ports = []manifest.Port{{HostIP: "127.0.0.1", HostPort: 9001, ContainerPort: 9001, Protocol: "tcp"}}
+	cfg.Models[0].Readiness = &manifest.Readiness{URL: "http://127.0.0.1:9001/health", SuccessStatus: 200}
+	cfg.Models[0].Placement = &manifest.Placement{GPUCount: 1, Strategy: "pcie_affinity"}
+	m := NewManager(cfg, driver, slog.Default())
+	m.gpus = fakeGPUProvider{devices: []gpu.Device{
+		{Index: 0, MemoryUsedMiB: 0}, {Index: 1, MemoryUsedMiB: 0},
+		{Index: 2, MemoryUsedMiB: 0}, {Index: 3, MemoryUsedMiB: 0},
+	}}
+	m.client = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Header:     make(http.Header),
+			Request:    r,
+		}, nil
+	})}
 	m.refresh(context.Background())
 	return m
 }
@@ -357,11 +752,25 @@ func waitOperation(t *testing.T, manager *Manager, id, state string) {
 	t.Fatalf("operation %s state = %s, want %s", id, op.State, state)
 }
 
+func intersects(left, right []int) bool {
+	seen := map[int]bool{}
+	for _, value := range left {
+		seen[value] = true
+	}
+	for _, value := range right {
+		if seen[value] {
+			return true
+		}
+	}
+	return false
+}
+
 type fakeDriver struct {
 	mu         sync.Mutex
 	states     map[string]deployment.ContainerState
 	calls      []string
 	blockStart chan struct{}
+	inspectErr error
 	startErr   error
 	stopErr    error
 }
@@ -384,7 +793,7 @@ func (d *fakeDriver) Start(ctx context.Context, model manifest.Model, assigned [
 	if d.startErr != nil {
 		return d.startErr
 	}
-	d.states[model.ID] = deployment.ContainerState{Exists: true, Running: true, Status: "running", AssignedGPUs: assigned}
+	d.states[model.ID] = deployment.ContainerState{Exists: true, Running: true, Status: "running", AssignedGPUs: assigned, Port: model.InstancePort}
 	return nil
 }
 
@@ -411,6 +820,9 @@ func (d *fakeDriver) Inspect(ctx context.Context, model manifest.Model) (deploym
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.calls = append(d.calls, "inspect:"+model.ID)
+	if d.inspectErr != nil {
+		return deployment.ContainerState{}, d.inspectErr
+	}
 	state, ok := d.states[model.ID]
 	if !ok {
 		return deployment.ContainerState{}, deployment.ErrNotFound

@@ -62,7 +62,7 @@
 				"io_uring_register"
 			],
 			"action": "SCMP_ACT_ALLOW",
-			"comment": "DeepSeek disk-backed B12X Engram requires liburing. Only addition to Docker 29.4.1 default; retain all other syscall restrictions."
+			"comment": "DeepSeek Engram and MiMo MOPD bounce loading require liburing. Only addition to Docker 29.4.1 default; retain all other syscall restrictions."
 		},
 		{
 			"names": [

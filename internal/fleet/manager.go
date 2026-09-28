@@ -31,16 +31,34 @@ const (
 )
 
 type ModelInfo struct {
-	ID          string `json:"id"`
-	Description string `json:"description,omitempty"`
-	Image       string `json:"image"`
-	GPUCount    int    `json:"gpu_count,omitempty"`
+	ID           string `json:"id"`
+	Description  string `json:"description,omitempty"`
+	Image        string `json:"image"`
+	GPUCount     int    `json:"gpu_count,omitempty"`
+	MaxInstances int    `json:"max_instances,omitempty"`
 }
 
 type Status struct {
-	ModelID      string    `json:"model_id"`
+	ModelID          string           `json:"model_id"`
+	Phase            Phase            `json:"phase"`
+	Desired          string           `json:"desired_state"`
+	DesiredInstances int              `json:"desired_instances,omitempty"`
+	ReadyInstances   int              `json:"ready_instances,omitempty"`
+	Instances        []InstanceStatus `json:"instances,omitempty"`
+	Container        string           `json:"container_status,omitempty"`
+	Health           string           `json:"health,omitempty"`
+	ExitCode         int              `json:"exit_code,omitempty"`
+	OOMKilled        bool             `json:"oom_killed,omitempty"`
+	AssignedGPUs     []int            `json:"assigned_gpus,omitempty"`
+	LastError        string           `json:"last_error,omitempty"`
+	LastChecked      time.Time        `json:"last_checked"`
+}
+
+type InstanceStatus struct {
+	InstanceID   string    `json:"instance_id"`
+	Index        int       `json:"index"`
+	Port         int       `json:"port,omitempty"`
 	Phase        Phase     `json:"phase"`
-	Desired      string    `json:"desired_state"`
 	Container    string    `json:"container_status,omitempty"`
 	Health       string    `json:"health,omitempty"`
 	ExitCode     int       `json:"exit_code,omitempty"`
@@ -51,14 +69,15 @@ type Status struct {
 }
 
 type Operation struct {
-	ID         string     `json:"id"`
-	Kind       string     `json:"kind"`
-	ModelID    string     `json:"model_id"`
-	State      string     `json:"state"`
-	Error      string     `json:"error,omitempty"`
-	CreatedAt  time.Time  `json:"created_at"`
-	StartedAt  *time.Time `json:"started_at,omitempty"`
-	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	ID              string     `json:"id"`
+	Kind            string     `json:"kind"`
+	ModelID         string     `json:"model_id"`
+	TargetInstances int        `json:"instances,omitempty"`
+	State           string     `json:"state"`
+	Error           string     `json:"error,omitempty"`
+	CreatedAt       time.Time  `json:"created_at"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	FinishedAt      *time.Time `json:"finished_at,omitempty"`
 }
 
 type ConflictError struct {
@@ -149,9 +168,64 @@ func (m *Manager) Models() []ModelInfo {
 		if model.Placement != nil {
 			gpuCount = model.Placement.GPUCount
 		}
-		models = append(models, ModelInfo{ID: model.ID, Description: model.Description, Image: model.Image, GPUCount: gpuCount})
+		models = append(models, ModelInfo{
+			ID: model.ID, Description: model.Description, Image: model.Image,
+			GPUCount: gpuCount, MaxInstances: m.maxInstancesLocked(model),
+		})
 	}
 	return models
+}
+
+func (m *Manager) maxInstancesLocked(model manifest.Model) int {
+	return maxInstancesForManifest(m.manifest, model)
+}
+
+func maxInstancesForManifest(cfg *manifest.Manifest, model manifest.Model) int {
+	limit := 1
+	if model.Placement != nil && model.Placement.GPUCount > 0 {
+		total := 0
+		for _, group := range cfg.Runtime.GPUTopology.Groups {
+			total += len(group)
+		}
+		limit = total / model.Placement.GPUCount
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	portLimit := portCapacityForManifest(cfg, model)
+	if portLimit < limit {
+		limit = portLimit
+	}
+	if limit > maxRequestedInstances {
+		return maxRequestedInstances
+	}
+	return limit
+}
+
+func (m *Manager) portCapacityLocked(model manifest.Model) int {
+	return portCapacityForManifest(m.manifest, model)
+}
+
+func portCapacityForManifest(cfg *manifest.Manifest, model manifest.Model) int {
+	if cfg.Runtime.ModelPortRange == nil {
+		return 1
+	}
+	base := basePort(model)
+	if base == 0 {
+		return 1
+	}
+	configured := configuredBasePorts(cfg)
+	count := 1
+	for port := cfg.Runtime.ModelPortRange.Start; port <= cfg.Runtime.ModelPortRange.End; port++ {
+		if port == base {
+			continue
+		}
+		if configured[port] {
+			continue
+		}
+		count++
+	}
+	return count
 }
 
 // ReloadManifest atomically replaces the active manifest after checking that
@@ -168,6 +242,12 @@ func (m *Manager) ReloadManifest(next *manifest.Manifest) error {
 	}
 	if next.Runtime.DockerBinary != m.manifest.Runtime.DockerBinary {
 		return errors.New("runtime.docker_binary cannot be changed without restarting fleet")
+	}
+	if !reflect.DeepEqual(next.Runtime.ModelPortRange, m.manifest.Runtime.ModelPortRange) && m.hasActiveDeploymentLocked() {
+		return errors.New("runtime.model_port_range cannot be changed while deployments are active")
+	}
+	if err := m.validateActiveInstancesAgainstManifestLocked(next); err != nil {
+		return err
 	}
 
 	for _, current := range m.manifest.Models {
@@ -198,7 +278,38 @@ func (m *Manager) ReloadManifest(next *manifest.Manifest) error {
 }
 
 func manifestModelCanChange(status Status) bool {
-	return status.Phase == PhaseUnloaded || status.Phase == PhaseFailed
+	return !statusHasLiveInstances(status) && (status.Phase == PhaseUnloaded || status.Phase == PhaseFailed)
+}
+
+func (m *Manager) hasActiveDeploymentLocked() bool {
+	for _, status := range m.statuses {
+		if statusHasLiveInstances(status) || statusActive(status) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *Manager) validateActiveInstancesAgainstManifestLocked(next *manifest.Manifest) error {
+	nextBasePorts := configuredBasePorts(next)
+	for _, status := range m.statuses {
+		if !statusHasLiveInstances(status) {
+			continue
+		}
+		for _, instance := range status.Instances {
+			if instance.Index > 1 && instance.Port != 0 && nextBasePorts[instance.Port] {
+				return fmt.Errorf("active replica %q port %d collides with a configured model port", instance.InstanceID, instance.Port)
+			}
+		}
+		model, present := next.Model(status.ModelID)
+		if !present {
+			continue
+		}
+		if max := maxInstancesForManifest(next, model); max < maxInstanceIndex(status) {
+			return fmt.Errorf("model %q active instance index exceeds new max_instances %d", status.ModelID, max)
+		}
+	}
+	return nil
 }
 
 func (m *Manager) pollDuration() time.Duration {
@@ -212,7 +323,7 @@ func (m *Manager) Statuses() []Status {
 	defer m.mu.RUnlock()
 	result := make([]Status, 0, len(m.statuses))
 	for _, status := range m.statuses {
-		result = append(result, status)
+		result = append(result, cloneStatus(status))
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].ModelID < result[j].ModelID })
 	return result
@@ -222,7 +333,7 @@ func (m *Manager) Status(modelID string) (Status, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	status, ok := m.statuses[modelID]
-	return status, ok
+	return cloneStatus(status), ok
 }
 
 func (m *Manager) Operation(id string) (Operation, bool) {
@@ -233,6 +344,10 @@ func (m *Manager) Operation(id string) (Operation, bool) {
 }
 
 func (m *Manager) Activate(modelID string) (Operation, bool, error) {
+	return m.ActivateInstances(modelID, nil)
+}
+
+func (m *Manager) ActivateInstances(modelID string, requested *int) (Operation, bool, error) {
 	m.mu.Lock()
 	cfg := m.manifest
 	model, ok := cfg.Model(modelID)
@@ -242,65 +357,50 @@ func (m *Manager) Activate(modelID string) (Operation, bool, error) {
 	}
 	if m.inFlight != "" {
 		op := m.operations[m.inFlight]
-		if op.Kind == "activate" && op.ModelID == modelID {
+		if op.Kind == "activate" && op.ModelID == modelID && (requested == nil || op.TargetInstances == *requested) {
 			m.mu.Unlock()
 			return op, true, nil
 		}
 		m.mu.Unlock()
 		return Operation{}, false, &ConflictError{Operation: op}
 	}
-	if m.isReadyNoopLocked(modelID, cfg) {
+	target := m.targetInstancesLocked(modelID, requested)
+	if target < 1 || target > maxRequestedInstances {
+		m.mu.Unlock()
+		return Operation{}, false, fmt.Errorf("instances must be between 1 and %d", maxRequestedInstances)
+	}
+	if target > m.maxInstancesLocked(model) {
+		m.mu.Unlock()
+		err := fmt.Errorf("requested %d instances, maximum is %d", target, m.maxInstancesLocked(model))
+		m.logger.Error("model load failed", "model_id", modelID, "error", err)
+		return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
+	}
+	plan, err := m.planInstancesLocked(cfg, model, target)
+	if err != nil {
+		m.mu.Unlock()
+		m.logger.Error("model load failed", "model_id", modelID, "error", err)
+		return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
+	}
+	if m.isReadyNoopLocked(modelID, cfg, target) {
 		status := m.statuses[modelID]
 		status.Desired = "ready"
+		status.DesiredInstances = target
 		m.statuses[modelID] = status
 		m.mu.Unlock()
 		return Operation{}, true, nil
 	}
-	var assignedGPUs []int
-	if model.Placement != nil {
-		devices, err := m.gpus.Snapshot(context.Background())
-		if err != nil {
-			m.mu.Unlock()
-			m.logger.Error("model load failed", "model_id", modelID, "error", err)
-			return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
-		}
-		allocator := gpu.Allocator{Topology: gpu.Topology{
-			Groups:           cfg.Runtime.GPUTopology.Groups,
-			MaxUsedMemoryMiB: cfg.Runtime.GPUTopology.MaxUsedMemoryMiB,
-		}}
-		var reserved []int
-		for id, status := range m.statuses {
-			if id == modelID {
-				continue
-			}
-			switch status.Phase {
-			case PhaseReady, PhaseLoading, PhaseUnhealthy:
-				reserved = append(reserved, status.AssignedGPUs...)
-			}
-		}
-		assignedGPUs, err = allocator.Allocate(devices, model.Placement.GPUCount, reserved)
-		if err != nil {
-			m.mu.Unlock()
-			m.logger.Error("model load failed", "model_id", modelID, "error", err)
-			return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
-		}
-		status := m.statuses[modelID]
-		status.Phase = PhaseLoading
-		status.Desired = "ready"
-		status.AssignedGPUs = append([]int(nil), assignedGPUs...)
-		status.LastChecked = time.Now().UTC()
-		m.statuses[modelID] = status
-	}
-	op := newOperation("activate", modelID)
+	m.markPlanLocked(modelID, plan)
+	op := newOperation("activate", modelID, target)
 	m.operations[op.ID] = op
 	m.inFlight = op.ID
 	m.mu.Unlock()
-	go m.runActivate(op.ID, cfg, model, assignedGPUs)
+	go m.runActivate(op.ID, cfg, model, plan)
 	return op, false, nil
 }
 
-func (m *Manager) isReadyNoopLocked(modelID string, cfg *manifest.Manifest) bool {
-	if m.statuses[modelID].Phase != PhaseReady {
+func (m *Manager) isReadyNoopLocked(modelID string, cfg *manifest.Manifest, target int) bool {
+	status := m.statuses[modelID]
+	if status.Phase != PhaseReady || status.ReadyInstances != target || len(status.Instances) != target {
 		return false
 	}
 	if cfg.Runtime.ConcurrentDeployments {
@@ -312,6 +412,232 @@ func (m *Manager) isReadyNoopLocked(modelID string, cfg *manifest.Manifest) bool
 		}
 	}
 	return true
+}
+
+func (m *Manager) targetInstancesLocked(modelID string, requested *int) int {
+	if requested != nil {
+		return *requested
+	}
+	status := m.statuses[modelID]
+	if len(status.Instances) > 1 {
+		return len(status.Instances)
+	}
+	if status.ReadyInstances > 1 {
+		return status.ReadyInstances
+	}
+	return 1
+}
+
+func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Model, target int) (instancePlan, error) {
+	current := sortedInstances(m.statuses[model.ID].Instances)
+	currentByIndex := map[int]InstanceStatus{}
+	kept := map[int]bool{}
+	plan := instancePlan{target: target}
+	for _, instance := range current {
+		currentByIndex[instance.Index] = instance
+		if instance.Index <= target && keepableInstance(instance) {
+			plan.keep = append(plan.keep, instance)
+			kept[instance.Index] = true
+		}
+	}
+	for i := len(current) - 1; i >= 0; i-- {
+		if current[i].Index > target {
+			plan.stop = append(plan.stop, plannedInstance{
+				model: cloneInstanceModel(model, current[i].Index, current[i].Port),
+				gpus:  append([]int(nil), current[i].AssignedGPUs...),
+				port:  current[i].Port,
+				index: current[i].Index,
+			})
+		}
+	}
+	if len(plan.keep) == target {
+		return plan, nil
+	}
+
+	var startIndexes []int
+	extraPortsNeeded := 0
+	for index := 1; index <= target; index++ {
+		if kept[index] {
+			continue
+		}
+		startIndexes = append(startIndexes, index)
+		if index > 1 && currentByIndex[index].Port == 0 {
+			extraPortsNeeded++
+		}
+	}
+	ports, err := m.allocatePortsLocked(model, extraPortsNeeded)
+	if err != nil {
+		return instancePlan{}, err
+	}
+	var devices []gpu.Device
+	var allocator gpu.Allocator
+	var reserved []int
+	if model.Placement != nil {
+		devices, err = m.gpus.Snapshot(context.Background())
+		if err != nil {
+			return instancePlan{}, err
+		}
+		allocator = gpu.Allocator{Topology: gpu.Topology{
+			Groups:           cfg.Runtime.GPUTopology.Groups,
+			MaxUsedMemoryMiB: cfg.Runtime.GPUTopology.MaxUsedMemoryMiB,
+		}}
+		reserved = m.reservedGPUsForPlanLocked(cfg, model.ID)
+	}
+	for _, index := range startIndexes {
+		currentInstance := currentByIndex[index]
+		port := basePort(model)
+		if index > 1 {
+			port = currentInstance.Port
+			if port == 0 {
+				port = ports[0]
+				ports = ports[1:]
+			}
+		}
+		if owner, taken := m.activePortOwnerLocked(model.ID, port); taken {
+			return instancePlan{}, fmt.Errorf("port %d is already used by %s", port, owner)
+		}
+		assigned := append([]int(nil), currentInstance.AssignedGPUs...)
+		if model.Placement != nil {
+			if len(assigned) == 0 {
+				assigned, err = allocator.Allocate(devices, model.Placement.GPUCount, reserved)
+				if err != nil {
+					return instancePlan{}, err
+				}
+			}
+			reserved = append(reserved, assigned...)
+		}
+		plan.start = append(plan.start, plannedInstance{
+			model: cloneInstanceModel(model, index, port),
+			gpus:  append([]int(nil), assigned...),
+			port:  port,
+			index: index,
+		})
+	}
+	return plan, nil
+}
+
+func keepableInstance(instance InstanceStatus) bool {
+	switch instance.Phase {
+	case PhaseReady, PhaseLoading, PhaseUnhealthy:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) allocatePortsLocked(model manifest.Model, needed int) ([]int, error) {
+	if needed <= 0 {
+		return nil, nil
+	}
+	if m.manifest.Runtime.ModelPortRange == nil {
+		return nil, errors.New("runtime.model_port_range is required for multiple instances")
+	}
+	configured := m.configuredBasePortsLocked()
+	reserved := m.reservedPortsLocked()
+	var ports []int
+	for port := m.manifest.Runtime.ModelPortRange.Start; port <= m.manifest.Runtime.ModelPortRange.End; port++ {
+		if port == basePort(model) || configured[port] || reserved[port] {
+			continue
+		}
+		ports = append(ports, port)
+		if len(ports) == needed {
+			return ports, nil
+		}
+	}
+	return nil, fmt.Errorf("need %d extra ports, found %d", needed, len(ports))
+}
+
+func (m *Manager) configuredBasePortsLocked() map[int]bool {
+	return configuredBasePorts(m.manifest)
+}
+
+func configuredBasePorts(cfg *manifest.Manifest) map[int]bool {
+	ports := map[int]bool{}
+	for _, model := range cfg.Models {
+		if port := basePort(model); port != 0 {
+			ports[port] = true
+		}
+	}
+	return ports
+}
+
+func (m *Manager) reservedPortsLocked() map[int]bool {
+	ports := map[int]bool{}
+	for _, status := range m.statuses {
+		for _, instance := range status.Instances {
+			if instance.Index > 1 && instance.Port != 0 && instance.Phase != PhaseUnloaded {
+				ports[instance.Port] = true
+			}
+		}
+	}
+	return ports
+}
+
+func (m *Manager) activePortOwnerLocked(exceptModelID string, port int) (string, bool) {
+	if port == 0 {
+		return "", false
+	}
+	for modelID, status := range m.statuses {
+		if modelID == exceptModelID {
+			continue
+		}
+		for _, instance := range status.Instances {
+			if instance.Port == port && instance.Phase != PhaseUnloaded {
+				return instance.InstanceID, true
+			}
+		}
+	}
+	return "", false
+}
+
+func (m *Manager) reservedGPUsLocked(exceptModelID string) []int {
+	return m.reservedGPUsForPlanLocked(m.manifest, exceptModelID)
+}
+
+func (m *Manager) reservedGPUsForPlanLocked(cfg *manifest.Manifest, exceptModelID string) []int {
+	var reserved []int
+	for id, status := range m.statuses {
+		if id == exceptModelID {
+			for _, instance := range status.Instances {
+				if instance.Phase != PhaseUnloaded {
+					reserved = append(reserved, instance.AssignedGPUs...)
+				}
+			}
+			continue
+		}
+		if !cfg.Runtime.ConcurrentDeployments {
+			continue
+		}
+		for _, instance := range status.Instances {
+			if instance.Phase != PhaseUnloaded {
+				reserved = append(reserved, instance.AssignedGPUs...)
+			}
+		}
+		if len(status.Instances) == 0 && statusActive(status) {
+			reserved = append(reserved, status.AssignedGPUs...)
+		}
+	}
+	return reserved
+}
+
+func (m *Manager) markPlanLocked(modelID string, plan instancePlan) {
+	now := time.Now().UTC()
+	instances := append([]InstanceStatus(nil), plan.keep...)
+	for _, start := range plan.start {
+		instances = append(instances, InstanceStatus{
+			InstanceID: instanceID(modelID, start.index), Index: start.index, Port: start.port,
+			Phase: PhaseLoading, AssignedGPUs: append([]int(nil), start.gpus...), LastChecked: now,
+		})
+	}
+	for _, stop := range plan.stop {
+		instances = append(instances, InstanceStatus{
+			InstanceID: instanceID(modelID, stop.index), Index: stop.index, Port: stop.port,
+			Phase: PhaseStopping, AssignedGPUs: append([]int(nil), stop.gpus...), LastChecked: now,
+		})
+	}
+	status := aggregateStatus(modelID, "ready", instances, false)
+	status.DesiredInstances = plan.target
+	m.statuses[modelID] = status
 }
 
 func (m *Manager) Unload(modelID string) (Operation, bool, error) {
@@ -337,7 +663,7 @@ func (m *Manager) Unload(modelID string) (Operation, bool, error) {
 		m.mu.Unlock()
 		return Operation{}, true, nil
 	}
-	op := newOperation("unload", modelID)
+	op := newOperation("unload", modelID, 0)
 	m.operations[op.ID] = op
 	m.inFlight = op.ID
 	m.mu.Unlock()
@@ -345,12 +671,12 @@ func (m *Manager) Unload(modelID string) (Operation, bool, error) {
 	return op, false, nil
 }
 
-func newOperation(kind, modelID string) Operation {
+func newOperation(kind, modelID string, targetInstances int) Operation {
 	buf := make([]byte, 12)
 	if _, err := rand.Read(buf); err != nil {
 		panic(fmt.Sprintf("generate operation id: %v", err))
 	}
-	return Operation{ID: hex.EncodeToString(buf), Kind: kind, ModelID: modelID, State: "pending", CreatedAt: time.Now().UTC()}
+	return Operation{ID: hex.EncodeToString(buf), Kind: kind, ModelID: modelID, TargetInstances: targetInstances, State: "pending", CreatedAt: time.Now().UTC()}
 }
 
 func (m *Manager) beginOperation(id string) {
@@ -394,7 +720,7 @@ func (m *Manager) finishOperation(id string, err error) {
 	m.mu.Unlock()
 }
 
-func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model manifest.Model, assignedGPUs []int) {
+func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model manifest.Model, plan instancePlan) {
 	modelID := model.ID
 	m.beginOperation(operationID)
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Runtime.ReadinessDuration())
@@ -408,7 +734,7 @@ func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model 
 			wasLoaded := m.currentStatus(other.ID).Phase != PhaseUnloaded
 			m.updateTransition(other.ID, PhaseStopping, "unloaded")
 			opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
-			err := m.driver.Stop(opCtx, other, cfg.Runtime.RemoveOnUnload)
+			err := m.stopAllInstances(opCtx, other, cfg.Runtime.RemoveOnUnload)
 			opCancel()
 			if err != nil {
 				m.setFailure(other.ID, err)
@@ -423,22 +749,37 @@ func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model 
 		}
 	}
 
-	m.updateTransition(modelID, PhaseLoading, "ready")
-	m.setAssignedGPUs(modelID, assignedGPUs)
-	opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
-	err := m.driver.Start(opCtx, model, assignedGPUs)
-	opCancel()
-	if err != nil {
-		m.setFailure(modelID, err)
-		m.finishOperation(operationID, err)
-		return
+	for _, stop := range plan.stop {
+		opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
+		err := m.driver.Stop(opCtx, stop.model, cfg.Runtime.RemoveOnUnload)
+		opCancel()
+		if err != nil {
+			m.setFailure(modelID, err)
+			m.finishOperation(operationID, err)
+			return
+		}
+		m.removeInstance(modelID, stop.index)
+	}
+
+	for _, start := range plan.start {
+		m.setInstancePhase(modelID, start.index, PhaseLoading, "")
+		opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
+		err := m.driver.Start(opCtx, start.model, start.gpus)
+		opCancel()
+		if err != nil {
+			m.setInstanceFailure(modelID, start.index, err)
+			m.finishOperation(operationID, err)
+			return
+		}
 	}
 
 	ticker := time.NewTicker(cfg.Runtime.PollDuration())
 	defer ticker.Stop()
 	for {
 		status := m.probe(ctx, model, cfg.Runtime)
-		if status.Phase == PhaseReady {
+		if status.ReadyInstances == plan.target && status.Phase == PhaseReady {
+			status.Desired = "ready"
+			status.DesiredInstances = plan.target
 			m.storeStatus(status)
 			m.finishOperation(operationID, nil)
 			return
@@ -451,6 +792,7 @@ func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model 
 		}
 		status.Phase = PhaseLoading
 		status.Desired = "ready"
+		status.DesiredInstances = plan.target
 		m.storeStatus(status)
 		select {
 		case <-ctx.Done():
@@ -469,7 +811,7 @@ func (m *Manager) runUnload(operationID string, cfg *manifest.Manifest, model ma
 	m.updateTransition(modelID, PhaseStopping, "unloaded")
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Runtime.OperationDuration())
 	defer cancel()
-	if err := m.driver.Stop(ctx, model, cfg.Runtime.RemoveOnUnload); err != nil {
+	if err := m.stopAllInstances(ctx, model, cfg.Runtime.RemoveOnUnload); err != nil {
 		m.setFailure(modelID, err)
 		m.finishOperation(operationID, err)
 		return
@@ -490,6 +832,10 @@ func (m *Manager) refresh(ctx context.Context) {
 			return
 		}
 		current := m.statuses[model.ID]
+		if m.inFlight != "" && m.operations[m.inFlight].ModelID == model.ID {
+			m.mu.RUnlock()
+			continue
+		}
 		m.mu.RUnlock()
 		// On restart, recover intent from an existing running container. Unknown
 		// also covers a failed first inspection; explicit stopping intent stays intact.
@@ -497,10 +843,14 @@ func (m *Manager) refresh(ctx context.Context) {
 			(status.Phase == PhaseReady || status.Phase == PhaseUnhealthy) {
 			status.Desired = "ready"
 		}
-		if current.Phase == PhaseLoading && status.Phase != PhaseReady && status.Phase != PhaseFailed {
+		if current.Phase == PhaseLoading && status.Phase != PhaseFailed {
 			status.Phase = PhaseLoading
 			status.Desired = "ready"
-			status.AssignedGPUs = append([]int(nil), current.AssignedGPUs...)
+			status.DesiredInstances = current.DesiredInstances
+			status.Instances = mergePendingInstances(status.Instances, current.Instances)
+			if len(status.AssignedGPUs) == 0 {
+				status.AssignedGPUs = append([]int(nil), current.AssignedGPUs...)
+			}
 		}
 		if current.Phase == PhaseStopping && status.Phase != PhaseUnloaded {
 			status.Phase = PhaseStopping
@@ -511,6 +861,15 @@ func (m *Manager) refresh(ctx context.Context) {
 			m.mu.Unlock()
 			return
 		}
+		latest := m.statuses[model.ID]
+		if m.inFlight != "" && m.operations[m.inFlight].ModelID == model.ID {
+			m.mu.Unlock()
+			continue
+		}
+		if latest.Phase != current.Phase || latest.LastChecked != current.LastChecked || latest.DesiredInstances != current.DesiredInstances {
+			m.mu.Unlock()
+			continue
+		}
 		m.statuses[status.ModelID] = status
 		m.mu.Unlock()
 	}
@@ -519,64 +878,104 @@ func (m *Manager) refresh(ctx context.Context) {
 func (m *Manager) probe(parent context.Context, model manifest.Model, runtime manifest.RuntimeConfig) Status {
 	ctx, cancel := context.WithTimeout(parent, runtime.OperationDuration())
 	defer cancel()
+	m.mu.RLock()
+	current := m.statuses[model.ID]
+	current = cloneStatus(current)
+	maxInstances := m.maxInstancesLocked(model)
+	if knownMax := maxInstanceIndex(current); knownMax > maxInstances {
+		maxInstances = knownMax
+	}
+	m.mu.RUnlock()
+	desired := current.Desired
+	if desired == "" {
+		desired = "unloaded"
+	}
+	knownPorts := map[int]int{1: basePort(model)}
+	for _, instance := range current.Instances {
+		if instance.Port != 0 {
+			knownPorts[instance.Index] = instance.Port
+		}
+	}
+	var instances []InstanceStatus
+	for index := 1; index <= maxInstances; index++ {
+		port := knownPorts[index]
+		status, found := m.probeInstance(ctx, model, runtime, index, port)
+		if found {
+			instances = append(instances, status)
+		}
+	}
+	status := aggregateStatus(model.ID, desired, instances, true)
+	if len(instances) == 0 {
+		status.LastChecked = time.Now().UTC()
+	}
+	return status
+}
+
+func (m *Manager) probeInstance(parent context.Context, model manifest.Model, runtime manifest.RuntimeConfig, index, port int) (InstanceStatus, bool) {
 	now := time.Now().UTC()
-	state, err := m.driver.Inspect(ctx, model)
+	instanceModel := cloneInstanceModel(model, index, port)
+	state, err := m.driver.Inspect(parent, instanceModel)
 	if errors.Is(err, deployment.ErrNotFound) {
-		return Status{ModelID: model.ID, Phase: PhaseUnloaded, Desired: "unloaded", LastChecked: now}
+		return InstanceStatus{}, false
+	}
+	status := InstanceStatus{
+		InstanceID: instanceID(model.ID, index), Index: index, Port: port,
+		LastChecked: now,
+	}
+	if state.Port != 0 {
+		status.Port = state.Port
+		instanceModel = cloneInstanceModel(model, index, state.Port)
 	}
 	if err != nil {
-		return Status{ModelID: model.ID, Phase: PhaseUnknown, Desired: m.desired(model.ID), LastError: err.Error(), LastChecked: now}
+		status.Phase = PhaseUnknown
+		status.LastError = err.Error()
+		return status, true
 	}
-	status := Status{
-		ModelID: model.ID, Desired: m.desired(model.ID), Container: state.Status,
-		Health: state.Health, ExitCode: state.ExitCode, OOMKilled: state.OOMKilled,
-		AssignedGPUs: state.AssignedGPUs, LastError: state.Error, LastChecked: now,
-	}
+	status.Container = state.Status
+	status.Health = state.Health
+	status.ExitCode = state.ExitCode
+	status.OOMKilled = state.OOMKilled
+	status.AssignedGPUs = append([]int(nil), state.AssignedGPUs...)
+	status.LastError = state.Error
 	if !state.Running {
 		status.Phase = PhaseUnloaded
 		if state.ExitCode != 0 || state.OOMKilled || state.Error != "" {
 			status.Phase = PhaseFailed
 		}
-		return status
+		return status, true
 	}
 	if state.Health == "unhealthy" {
 		status.Phase = PhaseUnhealthy
-		return status
+		return status, true
 	}
-	if model.Readiness != nil {
-		request, requestErr := http.NewRequestWithContext(parent, http.MethodGet, model.Readiness.URL, nil)
+	if instanceModel.Readiness != nil {
+		request, requestErr := http.NewRequestWithContext(parent, http.MethodGet, instanceModel.Readiness.URL, nil)
 		if requestErr != nil {
 			status.Phase = PhaseUnhealthy
 			status.LastError = requestErr.Error()
-			return status
+			return status, true
 		}
 		response, requestErr := m.client.Do(request)
 		if requestErr != nil {
 			status.Phase = PhaseUnhealthy
 			status.LastError = requestErr.Error()
-			return status
+			return status, true
 		}
 		response.Body.Close()
-		if response.StatusCode != model.Readiness.SuccessStatus {
+		if response.StatusCode != instanceModel.Readiness.SuccessStatus {
 			status.Phase = PhaseUnhealthy
 			status.LastError = fmt.Sprintf("readiness returned HTTP %d", response.StatusCode)
-			return status
+			return status, true
 		}
 	}
 	status.Phase = PhaseReady
-	return status
-}
-
-func (m *Manager) desired(modelID string) string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.statuses[modelID].Desired
+	return status, true
 }
 
 func (m *Manager) currentStatus(modelID string) Status {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.statuses[modelID]
+	return cloneStatus(m.statuses[modelID])
 }
 
 func (m *Manager) storeStatus(status Status) {
@@ -596,14 +995,6 @@ func (m *Manager) updateTransition(modelID string, phase Phase, desired string) 
 	m.mu.Unlock()
 }
 
-func (m *Manager) setAssignedGPUs(modelID string, assigned []int) {
-	m.mu.Lock()
-	status := m.statuses[modelID]
-	status.AssignedGPUs = append([]int(nil), assigned...)
-	m.statuses[modelID] = status
-	m.mu.Unlock()
-}
-
 func (m *Manager) setFailure(modelID string, err error) {
 	m.mu.Lock()
 	status := m.statuses[modelID]
@@ -614,6 +1005,55 @@ func (m *Manager) setFailure(modelID string, err error) {
 	m.mu.Unlock()
 }
 
+func (m *Manager) setInstancePhase(modelID string, index int, phase Phase, err string) {
+	m.mu.Lock()
+	status := cloneStatus(m.statuses[modelID])
+	for i := range status.Instances {
+		if status.Instances[i].Index == index {
+			status.Instances[i].Phase = phase
+			status.Instances[i].LastError = err
+			status.Instances[i].LastChecked = time.Now().UTC()
+			break
+		}
+	}
+	status = aggregateStatus(modelID, status.Desired, status.Instances, false)
+	m.statuses[modelID] = status
+	m.mu.Unlock()
+}
+
+func (m *Manager) setInstanceFailure(modelID string, index int, err error) {
+	m.setInstancePhase(modelID, index, PhaseFailed, err.Error())
+}
+
+func (m *Manager) removeInstance(modelID string, index int) {
+	m.mu.Lock()
+	status := m.statuses[modelID]
+	var instances []InstanceStatus
+	for _, instance := range status.Instances {
+		if instance.Index != index {
+			instances = append(instances, instance)
+		}
+	}
+	status = aggregateStatus(modelID, status.Desired, instances, true)
+	m.statuses[modelID] = status
+	m.mu.Unlock()
+}
+
 func (m *Manager) setUnloaded(modelID string) {
 	m.storeStatus(Status{ModelID: modelID, Phase: PhaseUnloaded, Desired: "unloaded", LastChecked: time.Now().UTC()})
+}
+
+func (m *Manager) stopAllInstances(ctx context.Context, model manifest.Model, remove bool) error {
+	status := m.currentStatus(model.ID)
+	instances := sortedInstances(status.Instances)
+	if len(instances) == 0 {
+		instances = []InstanceStatus{{InstanceID: model.ID, Index: 1, Port: basePort(model)}}
+	}
+	for i := len(instances) - 1; i >= 0; i-- {
+		instance := instances[i]
+		if err := m.driver.Stop(ctx, cloneInstanceModel(model, instance.Index, instance.Port), remove); err != nil {
+			return err
+		}
+	}
+	return nil
 }

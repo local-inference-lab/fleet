@@ -49,11 +49,16 @@ paths:
       - $ref: "#/components/parameters/ModelId"
     post:
       operationId: loadModel
-      description: Accepts no request body. Activation either performs an exclusive switch or reserves manifest-approved GPUs when concurrency is enabled.
+      description: Empty body preserves the legacy load behavior. A JSON body with instances requests an exact target replica count; Fleet reserves disjoint manifest-approved GPUs and ports before creating new containers.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/LoadRequest"}
       responses:
         "200": {description: Model was already ready}
         "202": {$ref: "#/components/responses/OperationAccepted"}
-        "400": {description: A request body or override was supplied, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+        "400": {description: Invalid body or instance count, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
         "404": {$ref: "#/components/responses/NotFound"}
         "409": {$ref: "#/components/responses/Conflict"}
   /v1/models/{modelId}/unload:
@@ -161,6 +166,18 @@ components:
         id: {type: string}
         description: {type: string}
         image: {type: string}
+        gpu_count: {type: integer, minimum: 0, description: Number of GPUs required by one instance when topology placement is configured}
+        max_instances: {type: integer, minimum: 1, description: Maximum instances that can fit the configured topology and dynamic port pool}
+    LoadRequest:
+      type: object
+      additionalProperties: false
+      required: [instances]
+      properties:
+        instances:
+          type: integer
+          minimum: 1
+          maximum: 64
+          description: Exact desired instance count for this profile. Omit the request body entirely for legacy ensure-loaded behavior.
     ModelWithStatus:
       type: object
       required: [model, status]
@@ -174,6 +191,35 @@ components:
         model_id: {type: string}
         phase: {type: string, enum: [unloaded, loading, ready, unhealthy, stopping, failed, unknown]}
         desired_state: {type: string, enum: [unloaded, ready]}
+        desired_instances:
+          type: integer
+          minimum: 0
+          description: Target instance count for the current lifecycle intent.
+        ready_instances:
+          type: integer
+          minimum: 0
+          description: Number of instances whose phase is ready.
+        instances:
+          type: array
+          description: Per-instance state. The first instance uses the base model ID; replicas use --N suffixes and dynamically assigned ports.
+          items: {$ref: "#/components/schemas/InstanceStatus"}
+        container_status: {type: string}
+        health: {type: string}
+        exit_code: {type: integer}
+        oom_killed: {type: boolean}
+        assigned_gpus:
+          type: array
+          items: {type: integer, minimum: 0}
+        last_error: {type: string}
+        last_checked: {type: string, format: date-time}
+    InstanceStatus:
+      type: object
+      required: [instance_id, index, phase, last_checked]
+      properties:
+        instance_id: {type: string}
+        index: {type: integer, minimum: 1}
+        port: {type: integer, minimum: 1, maximum: 65535}
+        phase: {type: string, enum: [unloaded, loading, ready, unhealthy, stopping, failed, unknown]}
         container_status: {type: string}
         health: {type: string}
         exit_code: {type: integer}
@@ -190,6 +236,10 @@ components:
         id: {type: string}
         kind: {type: string, enum: [activate, unload]}
         model_id: {type: string}
+        instances:
+          type: integer
+          minimum: 0
+          description: Target instance count for this lifecycle operation; unload uses zero.
         state: {type: string, enum: [pending, running, succeeded, failed]}
         error: {type: string}
         created_at: {type: string, format: date-time}

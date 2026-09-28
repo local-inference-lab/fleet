@@ -41,10 +41,13 @@ fi
 		Environment: map[string]string{
 			"TOKEN": "value with spaces; still literal",
 		},
-		Mounts:  []manifest.Mount{{Source: "/host/models", Target: "/models", ReadOnly: true}},
-		Ports:   []manifest.Port{{HostIP: "127.0.0.1", HostPort: 8000, ContainerPort: 8000, Protocol: "tcp"}},
-		GPUs:    "all",
-		Restart: "unless-stopped",
+		Mounts:      []manifest.Mount{{Source: "/host/models", Target: "/models", ReadOnly: true}},
+		Ports:       []manifest.Port{{HostIP: "127.0.0.1", HostPort: 8000, ContainerPort: 8000, Protocol: "tcp"}},
+		GPUs:        "all",
+		Restart:     "unless-stopped",
+		Init:        true,
+		Privileged:  true,
+		StopTimeout: "2m0s",
 	}
 	if err := driver.Start(context.Background(), model, []int{0, 1}); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -56,11 +59,67 @@ fi
 	args := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	for _, want := range []string{
 		"create", "--name", "lil-fleet-safe-model", "--env", "TOKEN=value with spaces; still literal",
+		"--label", "ai.local-inference-lab.lil-fleet.model=safe-model",
+		"--label", "ai.local-inference-lab.lil-fleet.instance=safe-model",
+		"--label", "ai.local-inference-lab.lil-fleet.instance_index=1",
+		"--label", "ai.local-inference-lab.lil-fleet.port=0",
 		"--mount", "type=bind,source=/host/models,target=/models,readonly",
 		"--publish", "127.0.0.1:8000:8000/tcp", "example/image@sha256:abc",
 		"--gpus", "\"device=0,1\"",
+		"--init", "--privileged", "--stop-timeout", "120",
 		"--restart", "unless-stopped",
 		"model with spaces", "; touch /tmp/not-executed", "start",
+	} {
+		if !contains(args, want) {
+			t.Fatalf("Docker args missing %q:\n%s", want, raw)
+		}
+	}
+}
+
+func TestStartLabelsReplicaInstanceAndUsesReplicaName(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "args.log")
+	statePath := filepath.Join(dir, "exists")
+	scriptPath := filepath.Join(dir, "docker")
+	script := `#!/bin/sh
+if [ "$1" = "inspect" ] && [ ! -f "$FAKE_DOCKER_STATE" ]; then
+  echo "error: no such object" >&2
+  exit 1
+fi
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$FAKE_DOCKER_LOG"
+done
+if [ "$1" = "create" ]; then
+  : > "$FAKE_DOCKER_STATE"
+fi
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake docker: %v", err)
+	}
+	t.Setenv("FAKE_DOCKER_LOG", logPath)
+	t.Setenv("FAKE_DOCKER_STATE", statePath)
+
+	model := manifest.Model{
+		ID: "alpha--2", Image: "example/image",
+		InstanceProfileID: "alpha", InstanceID: "alpha--2", InstanceIndex: 2, InstancePort: 9002,
+		Command: []string{"serve", "--port", "9002"},
+		Ports:   []manifest.Port{{HostIP: "127.0.0.1", HostPort: 9002, ContainerPort: 9002, Protocol: "tcp"}},
+	}
+	if err := NewCLIDriver(scriptPath).Start(context.Background(), model, []int{1}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read fake Docker args: %v", err)
+	}
+	args := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	for _, want := range []string{
+		"--name", "lil-fleet-alpha--2",
+		"--label", "ai.local-inference-lab.lil-fleet.model=alpha",
+		"--label", "ai.local-inference-lab.lil-fleet.instance=alpha--2",
+		"--label", "ai.local-inference-lab.lil-fleet.instance_index=2",
+		"--label", "ai.local-inference-lab.lil-fleet.port=9002",
+		"--publish", "127.0.0.1:9002:9002/tcp",
 	} {
 		if !contains(args, want) {
 			t.Fatalf("Docker args missing %q:\n%s", want, raw)

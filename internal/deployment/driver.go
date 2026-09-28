@@ -18,6 +18,7 @@ type ContainerState struct {
 	OOMKilled    bool
 	Error        string
 	AssignedGPUs []int
+	Port         int
 }
 
 type Driver interface {

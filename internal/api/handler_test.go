@@ -27,7 +27,7 @@ func TestHandlerRejectsRuntimeOverrides(t *testing.T) {
 		body   string
 	}{
 		{
-			name:   "load endpoint accepts no body",
+			name:   "load endpoint rejects runtime overrides",
 			method: http.MethodPost,
 			path:   "/v1/models/alpha/load",
 			body:   `{"environment":{"MAX_MODEL_LEN":"1"}}`,
@@ -62,6 +62,34 @@ func TestHandlerRejectsRuntimeOverrides(t *testing.T) {
 				t.Fatalf("missing structured error: %s", recorder.Body.String())
 			}
 		})
+	}
+}
+
+func TestHandlerLoadAcceptsStrictInstanceCount(t *testing.T) {
+	handler := newTestHandler(t)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/v1/models/alpha/load", bytes.NewBufferString(`{"instances":1}`))
+	handler.ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("load status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Operation fleet.Operation `json:"operation"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if payload.Operation.TargetInstances != 1 {
+		t.Fatalf("operation instances = %d, want 1", payload.Operation.TargetInstances)
+	}
+
+	for _, body := range []string{`{"instances":0}`, `{"instances":65}`, `{"instances":1,"image":"x"}`, `{}`} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/v1/models/alpha/load", bytes.NewBufferString(body))
+		handler.ServeHTTP(recorder, request)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("load body %s status = %d, want 400; response=%s", body, recorder.Code, recorder.Body.String())
+		}
 	}
 }
 
@@ -209,7 +237,7 @@ type apiDriver struct {
 func (d *apiDriver) Start(_ context.Context, model manifest.Model, assigned []int) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.states[model.ID] = deployment.ContainerState{Exists: true, Running: true, Status: "running", AssignedGPUs: assigned}
+	d.states[model.ID] = deployment.ContainerState{Exists: true, Running: true, Status: "running", AssignedGPUs: assigned, Port: model.InstancePort}
 	return nil
 }
 

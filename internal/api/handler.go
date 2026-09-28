@@ -57,7 +57,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "models" && r.Method == http.MethodGet:
 		h.handleModel(w, parts[2])
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "models" && parts[3] == "load" && r.Method == http.MethodPost:
-		h.requireEmptyBody(w, r, func() { h.handleActivate(w, parts[2]) })
+		h.handleActivate(w, r, parts[2])
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "models" && parts[3] == "unload" && r.Method == http.MethodPost:
 		h.requireEmptyBody(w, r, func() { h.handleUnload(w, parts[2]) })
 	case r.Method == http.MethodPost && path == "v1/deployments/switch":
@@ -136,11 +136,16 @@ func (h *Handler) handleSwitch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "model_id is required", nil)
 		return
 	}
-	h.handleActivate(w, request.ModelID)
+	op, noOp, err := h.manager.Activate(request.ModelID)
+	h.writeLifecycleResult(w, op, noOp, err)
 }
 
-func (h *Handler) handleActivate(w http.ResponseWriter, id string) {
-	op, noOp, err := h.manager.Activate(id)
+func (h *Handler) handleActivate(w http.ResponseWriter, r *http.Request, id string) {
+	instances, ok := decodeLoadRequest(w, r)
+	if !ok {
+		return
+	}
+	op, noOp, err := h.manager.ActivateInstances(id, instances)
 	h.writeLifecycleResult(w, op, noOp, err)
 }
 
@@ -174,6 +179,45 @@ func (h *Handler) writeLifecycleResult(w http.ResponseWriter, op fleet.Operation
 	}
 	w.Header().Set("Location", "/v1/operations/"+op.ID)
 	writeJSON(w, status, map[string]any{"changed": !noOp, "operation": op})
+}
+
+func decodeLoadRequest(w http.ResponseWriter, r *http.Request) (*int, bool) {
+	defer r.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+		return nil, false
+	}
+	if len(strings.TrimSpace(string(body))) == 0 {
+		return nil, true
+	}
+	var request struct {
+		Instances *int `json:"instances"`
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(body)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("decode JSON: %w", err).Error(), nil)
+		return nil, false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			writeError(w, http.StatusBadRequest, "invalid_request", "request must contain exactly one JSON object", nil)
+			return nil, false
+		}
+		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("decode trailing JSON: %w", err).Error(), nil)
+		return nil, false
+	}
+	if request.Instances == nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "instances is required when a load request body is provided", nil)
+		return nil, false
+	}
+	if *request.Instances < 1 || *request.Instances > 64 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "instances must be between 1 and 64", nil)
+		return nil, false
+	}
+	return request.Instances, true
 }
 
 func (h *Handler) handleOperation(w http.ResponseWriter, id string) {

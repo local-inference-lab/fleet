@@ -32,6 +32,8 @@ func TestLoadAppliesDefaultsAndSortsImmutableModelProfiles(t *testing.T) {
 				"gpus": "device=0",
 				"shm_size": "16g",
 				"ipc": "host",
+				"memory_limit": "40g",
+				"memory_swap_limit": "40g",
 				"privileged": true,
 				"stop_timeout": "2m0s",
 				"readiness": {"url": "http://127.0.0.1:8001/health"}
@@ -73,6 +75,16 @@ func TestLoadAppliesDefaultsAndSortsImmutableModelProfiles(t *testing.T) {
 	}
 	if !qwen.Privileged || qwen.StopTimeoutSeconds() != 120 {
 		t.Fatalf("privileged/stop timeout = %v/%d, want true/120", qwen.Privileged, qwen.StopTimeoutSeconds())
+	}
+	if qwen.MemoryLimit != "40g" || qwen.MemorySwapLimit != "40g" {
+		t.Fatalf("memory limits = %q/%q, want 40g/40g", qwen.MemoryLimit, qwen.MemorySwapLimit)
+	}
+	glm, ok := cfg.Model("glm")
+	if !ok {
+		t.Fatal("glm model missing")
+	}
+	if glm.MemoryLimit != "" || glm.MemorySwapLimit != "" {
+		t.Fatalf("default memory limits = %q/%q, want empty", glm.MemoryLimit, glm.MemorySwapLimit)
 	}
 }
 
@@ -224,6 +236,33 @@ func TestLoadRejectsUnknownFieldsAndInvalidProfiles(t *testing.T) {
 			}`,
 			wantErr: "stop_timeout",
 		},
+		{
+			name: "invalid memory limit",
+			body: `{
+				"version": 1,
+				"runtime": {},
+				"models": [{"id": "a", "image": "one", "memory_limit": "40gb"}]
+			}`,
+			wantErr: "memory_limit",
+		},
+		{
+			name: "memory swap requires memory",
+			body: `{
+				"version": 1,
+				"runtime": {},
+				"models": [{"id": "a", "image": "one", "memory_swap_limit": "40g"}]
+			}`,
+			wantErr: "memory_swap_limit requires memory_limit",
+		},
+		{
+			name: "memory swap must not be below memory",
+			body: `{
+				"version": 1,
+				"runtime": {},
+				"models": [{"id": "a", "image": "one", "memory_limit": "40g", "memory_swap_limit": "39g"}]
+			}`,
+			wantErr: "memory_swap_limit must be -1",
+		},
 	}
 
 	for _, tt := range tests {
@@ -233,6 +272,21 @@ func TestLoadRejectsUnknownFieldsAndInvalidProfiles(t *testing.T) {
 				t.Fatalf("Load error = %v, want containing %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoadAllowsUnlimitedMemorySwapWhenMemoryLimitIsSet(t *testing.T) {
+	cfg := loadManifest(t, `{
+		"version": 1,
+		"runtime": {},
+		"models": [{"id": "a", "image": "one", "memory_limit": "1m", "memory_swap_limit": "-1"}]
+	}`)
+	model, ok := cfg.Model("a")
+	if !ok {
+		t.Fatal("model a missing")
+	}
+	if model.MemoryLimit != "1m" || model.MemorySwapLimit != "-1" {
+		t.Fatalf("memory limits = %q/%q, want 1m/-1", model.MemoryLimit, model.MemorySwapLimit)
 	}
 }
 

@@ -41,13 +41,15 @@ fi
 		Environment: map[string]string{
 			"TOKEN": "value with spaces; still literal",
 		},
-		Mounts:      []manifest.Mount{{Source: "/host/models", Target: "/models", ReadOnly: true}},
-		Ports:       []manifest.Port{{HostIP: "127.0.0.1", HostPort: 8000, ContainerPort: 8000, Protocol: "tcp"}},
-		GPUs:        "all",
-		Restart:     "unless-stopped",
-		Init:        true,
-		Privileged:  true,
-		StopTimeout: "2m0s",
+		Mounts:          []manifest.Mount{{Source: "/host/models", Target: "/models", ReadOnly: true}},
+		Ports:           []manifest.Port{{HostIP: "127.0.0.1", HostPort: 8000, ContainerPort: 8000, Protocol: "tcp"}},
+		GPUs:            "all",
+		MemoryLimit:     "40g",
+		MemorySwapLimit: "40g",
+		Restart:         "unless-stopped",
+		Init:            true,
+		Privileged:      true,
+		StopTimeout:     "2m0s",
 	}
 	if err := driver.Start(context.Background(), model, []int{0, 1}); err != nil {
 		t.Fatalf("Start() error = %v", err)
@@ -66,6 +68,7 @@ fi
 		"--mount", "type=bind,source=/host/models,target=/models,readonly",
 		"--publish", "127.0.0.1:8000:8000/tcp", "example/image@sha256:abc",
 		"--gpus", "\"device=0,1\"",
+		"--memory", "40g", "--memory-swap", "40g",
 		"--init", "--privileged", "--stop-timeout", "120",
 		"--restart", "unless-stopped",
 		"model with spaces", "; touch /tmp/not-executed", "start",

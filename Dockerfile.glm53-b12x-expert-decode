@@ -1,0 +1,32 @@
+FROM voipmonitor/vllm@sha256:414ec7d0d28358cfd8af0697f330f5c8acbb80e4dc4e5ba69c9fd5b5855ea804
+
+ARG B12X_REF=fede2445a50c6df150e36fb5f54778bbeba14744
+
+RUN /opt/venv/bin/python -m pip install --no-deps --force-reinstall \
+    "b12x @ git+https://github.com/joninco/b12x.git@${B12X_REF}"
+
+ENV PYTHONPATH=/opt/exllamav3:/opt/infernal-invocation/vllm \
+    VLLM_PLUGINS=""
+
+ENV LOCAL_INFERENCE_CACHE_FINGERPRINT=cu133-torch213-vllmf0fa1cefc1-b12xfede2445-lmcachee045d729bc
+ENV XDG_CACHE_HOME=/cache/jit/${LOCAL_INFERENCE_CACHE_FINGERPRINT}
+ENV VLLM_CACHE_ROOT=${XDG_CACHE_HOME}/vllm \
+    VLLM_CACHE_DIR=${XDG_CACHE_HOME}/vllm \
+    TRITON_CACHE_DIR=${XDG_CACHE_HOME}/triton \
+    TORCHINDUCTOR_CACHE_DIR=${XDG_CACHE_HOME}/torchinductor \
+    VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR=${XDG_CACHE_HOME}/flashinfer-autotune \
+    TVM_FFI_CACHE_DIR=${XDG_CACHE_HOME}/tvm-ffi \
+    TVM_CACHE_DIR=${XDG_CACHE_HOME}/tvm \
+    TILELANG_CACHE_DIR=${XDG_CACHE_HOME}/tilelang \
+    CUTE_DSL_CACHE_DIR=${XDG_CACHE_HOME}/cute-dsl \
+    B12X_CUTE_COMPILE_CACHE_DIR=${XDG_CACHE_HOME}/b12x/cute \
+    B12X_COMPILE_CACHE_DIR=${XDG_CACHE_HOME}/b12x/compile \
+    SPARKINFER_COMPILE_CACHE_DIR=${XDG_CACHE_HOME}/b12x/compile \
+    DG_JIT_CACHE_DIR=${XDG_CACHE_HOME}/deep-gemm \
+    MM_SPARSE_ATTN_AOT_CACHE=${XDG_CACHE_HOME}/minfer/mm-sparse-attn \
+    MINFER_FMHA_CACHE_DIR=${XDG_CACHE_HOME}/minfer/fmha-sm120 \
+    NUMBA_CACHE_DIR=${XDG_CACHE_HOME}/numba \
+    CUDA_CACHE_PATH=${XDG_CACHE_HOME}/cuda \
+    CUPY_CACHE_DIR=${XDG_CACHE_HOME}/cupy
+
+LABEL ai.local-inference-lab.lil-fleet.b12x_ref="${B12X_REF}"

@@ -19,6 +19,7 @@ var (
 	validID            = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,62}$`)
 	reservedReplicaID  = regexp.MustCompile(`--([2-9]|[1-5][0-9]|6[0-4])$`)
 	validRestartPolicy = regexp.MustCompile(`^(no|always|unless-stopped|on-failure(:[1-9][0-9]*)?)$`)
+	validMemoryLimit   = regexp.MustCompile(`^[1-9][0-9]*[bBkKmMgGtTpP]?$`)
 )
 
 type Manifest struct {
@@ -57,27 +58,29 @@ type GPUTopology struct {
 }
 
 type Model struct {
-	ID          string            `json:"id"`
-	Description string            `json:"description,omitempty"`
-	Image       string            `json:"image"`
-	Command     []string          `json:"command,omitempty"`
-	Environment map[string]string `json:"environment,omitempty"`
-	Mounts      []Mount           `json:"mounts,omitempty"`
-	Ports       []Port            `json:"ports,omitempty"`
-	GPUs        string            `json:"gpus,omitempty"`
-	Placement   *Placement        `json:"placement,omitempty"`
-	ShmSize     string            `json:"shm_size,omitempty"`
-	IPC         string            `json:"ipc,omitempty"`
-	Entrypoint  string            `json:"entrypoint,omitempty"`
-	NetworkMode string            `json:"network_mode,omitempty"`
-	SecurityOpt []string          `json:"security_opt,omitempty"`
-	Ulimits     []string          `json:"ulimits,omitempty"`
-	Restart     string            `json:"restart,omitempty"`
-	Init        bool              `json:"init,omitempty"`
-	Privileged  bool              `json:"privileged,omitempty"`
-	StopTimeout string            `json:"stop_timeout,omitempty"`
-	Readiness   *Readiness        `json:"readiness,omitempty"`
-	stopTimeout time.Duration
+	ID              string            `json:"id"`
+	Description     string            `json:"description,omitempty"`
+	Image           string            `json:"image"`
+	Command         []string          `json:"command,omitempty"`
+	Environment     map[string]string `json:"environment,omitempty"`
+	Mounts          []Mount           `json:"mounts,omitempty"`
+	Ports           []Port            `json:"ports,omitempty"`
+	GPUs            string            `json:"gpus,omitempty"`
+	Placement       *Placement        `json:"placement,omitempty"`
+	ShmSize         string            `json:"shm_size,omitempty"`
+	IPC             string            `json:"ipc,omitempty"`
+	Entrypoint      string            `json:"entrypoint,omitempty"`
+	NetworkMode     string            `json:"network_mode,omitempty"`
+	MemoryLimit     string            `json:"memory_limit,omitempty"`
+	MemorySwapLimit string            `json:"memory_swap_limit,omitempty"`
+	SecurityOpt     []string          `json:"security_opt,omitempty"`
+	Ulimits         []string          `json:"ulimits,omitempty"`
+	Restart         string            `json:"restart,omitempty"`
+	Init            bool              `json:"init,omitempty"`
+	Privileged      bool              `json:"privileged,omitempty"`
+	StopTimeout     string            `json:"stop_timeout,omitempty"`
+	Readiness       *Readiness        `json:"readiness,omitempty"`
+	stopTimeout     time.Duration
 
 	InstanceProfileID string `json:"-"`
 	InstanceID        string `json:"-"`
@@ -213,6 +216,9 @@ func (m *Manifest) validate() error {
 		if model.Restart != "" && !validRestartPolicy.MatchString(model.Restart) {
 			return fmt.Errorf("model %q: invalid restart policy %q", model.ID, model.Restart)
 		}
+		if err := validateMemoryLimits(model); err != nil {
+			return err
+		}
 		if model.StopTimeout != "" {
 			model.stopTimeout, err = parseStopTimeout(model.StopTimeout)
 			if err != nil {
@@ -293,6 +299,67 @@ func (m *Manifest) validate() error {
 	}
 	sort.Slice(m.Models, func(i, j int) bool { return m.Models[i].ID < m.Models[j].ID })
 	return nil
+}
+
+func validateMemoryLimits(model *Model) error {
+	memoryBytes := int64(0)
+	if model.MemoryLimit != "" {
+		var err error
+		memoryBytes, err = parseDockerMemoryQuantity(model.MemoryLimit)
+		if err != nil {
+			return fmt.Errorf("model %q: memory_limit: %w", model.ID, err)
+		}
+	}
+	if model.MemorySwapLimit == "" {
+		return nil
+	}
+	if model.MemoryLimit == "" {
+		return fmt.Errorf("model %q: memory_swap_limit requires memory_limit", model.ID)
+	}
+	if model.MemorySwapLimit == "-1" {
+		return nil
+	}
+	swapBytes, err := parseDockerMemoryQuantity(model.MemorySwapLimit)
+	if err != nil {
+		return fmt.Errorf("model %q: memory_swap_limit: %w", model.ID, err)
+	}
+	if swapBytes < memoryBytes {
+		return fmt.Errorf("model %q: memory_swap_limit must be -1 or greater than or equal to memory_limit", model.ID)
+	}
+	return nil
+}
+
+func parseDockerMemoryQuantity(value string) (int64, error) {
+	if !validMemoryLimit.MatchString(value) {
+		return 0, errors.New("must be a positive Docker memory quantity")
+	}
+	suffix := value[len(value)-1]
+	number := value
+	multiplier := int64(1)
+	switch suffix {
+	case 'b', 'B':
+		number = value[:len(value)-1]
+	case 'k', 'K':
+		number = value[:len(value)-1]
+		multiplier = 1024
+	case 'm', 'M':
+		number = value[:len(value)-1]
+		multiplier = 1024 * 1024
+	case 'g', 'G':
+		number = value[:len(value)-1]
+		multiplier = 1024 * 1024 * 1024
+	case 't', 'T':
+		number = value[:len(value)-1]
+		multiplier = 1024 * 1024 * 1024 * 1024
+	case 'p', 'P':
+		number = value[:len(value)-1]
+		multiplier = 1024 * 1024 * 1024 * 1024 * 1024
+	}
+	parsed, err := strconv.ParseInt(number, 10, 64)
+	if err != nil || parsed <= 0 || parsed > (1<<63-1)/multiplier {
+		return 0, errors.New("must fit in signed 64-bit bytes")
+	}
+	return parsed * multiplier, nil
 }
 
 func (r PortRange) Contains(port int) bool {

@@ -129,6 +129,12 @@ func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPU
 	if model.NetworkMode != "" {
 		args = append(args, "--network", model.NetworkMode)
 	}
+	if model.MemoryLimit != "" {
+		args = append(args, "--memory", model.MemoryLimit)
+	}
+	if model.MemorySwapLimit != "" {
+		args = append(args, "--memory-swap", model.MemorySwapLimit)
+	}
 	if model.Entrypoint != "" {
 		args = append(args, "--entrypoint", model.Entrypoint)
 	}

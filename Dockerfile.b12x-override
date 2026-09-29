@@ -6,4 +6,18 @@ ARG B12X_REF=f20ab3bad7def65f6211403fb73f9b1e8a33dfb0
 RUN /opt/venv/bin/python -m pip install --no-deps --force-reinstall \
     "b12x @ git+https://github.com/local-inference-lab/b12x.git@${B12X_REF}"
 
+COPY overrides/patch_b12x_preparation_lifetimes.py /tmp/patch_b12x_preparation_lifetimes.py
+RUN /opt/venv/bin/python /tmp/patch_b12x_preparation_lifetimes.py \
+    && rm /tmp/patch_b12x_preparation_lifetimes.py
+
+COPY overrides/patch_qwen_gdn_warmup.py /tmp/patch_qwen_gdn_warmup.py
+RUN /opt/venv/bin/python /tmp/patch_qwen_gdn_warmup.py \
+    && rm /tmp/patch_qwen_gdn_warmup.py
+
+COPY overrides/test_b12x_preparation_lifetimes.py /tmp/test_b12x_preparation_lifetimes.py
+COPY overrides/test_qwen_gdn_warmup.py /tmp/test_qwen_gdn_warmup.py
+RUN /opt/venv/bin/python /tmp/test_b12x_preparation_lifetimes.py \
+    && /opt/venv/bin/python /tmp/test_qwen_gdn_warmup.py \
+    && rm /tmp/test_b12x_preparation_lifetimes.py /tmp/test_qwen_gdn_warmup.py
+
 LABEL ai.local-inference-lab.lil-fleet.b12x_ref="${B12X_REF}"

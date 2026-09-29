@@ -36,8 +36,8 @@
     {
       "id": "ds41-flash-tp4-ssd",
       "description": "DeepSeek V4.1 Flash TP4 with disk-backed Engram tables",
-      "image": "lil-fleet/b12x:f20ab3bad7de",
-      "entrypoint": "/usr/local/bin/lil-serve",
+      "image": "ghcr.io/local-inference-lab/vllm:karmic-kraken-beta-20260929-b5e549c38e7e4a5f",
+      "entrypoint": "/opt/lil/fleet-overrides/lil-serve-b12x-preparation-bound.sh",
       "command": [
         "--profile",
         "ds41-flash",
@@ -61,6 +61,21 @@
         {
           "source": "/mnt/llm_stuff/cache",
           "target": "/cache"
+        },
+        {
+          "source": "/home/clay/research/lil-fleet/overrides/apply_b12x_preparation_bound.py",
+          "target": "/opt/lil/fleet-overrides/apply_b12x_preparation_bound.py",
+          "read_only": true
+        },
+        {
+          "source": "/home/clay/research/lil-fleet/overrides/lil-serve-b12x-preparation-bound.sh",
+          "target": "/opt/lil/fleet-overrides/lil-serve-b12x-preparation-bound.sh",
+          "read_only": true
+        },
+        {
+          "source": "/home/clay/research/lil-fleet/overrides/apply_vllm_sequence_info.py",
+          "target": "/opt/lil/fleet-overrides/apply_vllm_sequence_info.py",
+          "read_only": true
         }
       ],
       "placement": {
@@ -81,7 +96,18 @@
       "readiness": {
         "url": "http://127.0.0.1:8101/health",
         "success_status": 200
-      }
+      },
+      "environment": {
+        "B12X_WEIGHTS_COMPILE_WORKERS": "1",
+        "B12X_STATE_COMPILE_WORKERS": "1",
+        "B12X_BIND_COMPILE_WORKERS": "1",
+        "B12X_COMPILE_MEMORY_CACHE_SIZE": "64",
+        "LIL_B12X_PREPARATION_FACTORY_CACHE": "0",
+        "LIL_B12X_PREPARATION_RACE_BATCH": "2",
+        "LIL_VLLM_SEQUENCE_INFO": "1"
+      },
+      "memory_limit": "40g",
+      "memory_swap_limit": "40g"
     },
     {
       "id": "glm53-flash-tp4",
@@ -819,8 +845,8 @@
     },
     {
       "id": "qwen38-27b-nvfp4-qad7000-tp1",
-      "description": "Qwen 3.8 27B NVFP4 QAD step 7000 TP1 with B12X attention and linear backends",
-      "image": "lil-fleet/b12x:f20ab3bad7de",
+      "description": "Qwen 3.8 27B NVFP4 QAD step 7000 TP1 with FlashInfer attention, native GDN and MTP3",
+      "image": "lil-fleet/b12x:qwen27b-startup-fixes-20260928",
       "entrypoint": "/opt/venv/bin/python",
       "command": [
         "-m",
@@ -834,13 +860,15 @@
         "--dtype",
         "bfloat16",
         "--attention-backend",
-        "B12X",
+        "FLASHINFER",
+        "--block-size",
+        "64",
         "--linear-backend",
         "b12x",
         "--gdn-prefill-backend",
-        "b12x",
+        "flashinfer",
         "--gdn-decode-kernel",
-        "b12x",
+        "cuda",
         "--enable-auto-tool-choice",
         "--reasoning-parser",
         "qwen3",
@@ -858,13 +886,22 @@
         "--host",
         "0.0.0.0",
         "--port",
-        "8114"
+        "8114",
+        "--compilation-config",
+        "{\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}",
+        "--max-cudagraph-capture-size",
+        "256",
+        "--speculative-config",
+        "{\"method\":\"mtp\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"greedy\",\"attention_backend\":\"flashinfer\"}"
       ],
       "environment": {
-        "ATTENTION_BACKEND": "B12X",
-        "B12X_GDN": "1",
+        "ATTENTION_BACKEND": "FLASHINFER",
         "LINEAR_BACKEND": "b12x",
-        "VLLM_WORKER_MULTIPROC_METHOD": "spawn"
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "B12X_COMPILE_CACHE_DIR": "/cache/b12x",
+        "B12X_WEIGHTS_COMPILE_WORKERS": "1",
+        "B12X_STATE_COMPILE_WORKERS": "1",
+        "B12X_BIND_COMPILE_WORKERS": "1"
       },
       "mounts": [
         {

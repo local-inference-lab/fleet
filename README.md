@@ -96,6 +96,10 @@ The MiMo Opus55 profiles use the published `madeby561/vllm:mimo-v26-flash-b12x-2
 
 TP1 through TP4 stay within one PCIe group; TP6 takes one complete group plus two GPUs from the other; TP8 requires all GPUs. Replica loads reserve disjoint GPU sets and distinct ports from the shared `8101` through `8121` pool before creating containers, so `{"instances":2}` works for TP4 when both four-GPU groups are free. Live `nvidia-smi` memory use prevents Fleet from allocating GPUs occupied by workloads it did not create. A placement that cannot fit returns `409 Conflict` without creating a container.
 
+The DeepSeek profile bounds host startup memory with one B12X compiler per TP rank, a 64-entry compiled-object memory cache, and 40 GiB RAM with no swap per replica. Its [startup wrapper](overrides/lil-serve-b12x-preparation-bound.sh) applies a checked, idempotent [B12X preparation patch](overrides/apply_b12x_preparation_bound.py) before the requested Karmic image's launcher: `LIL_B12X_PREPARATION_FACTORY_CACHE=0` releases discarded factory results and `LIL_B12X_PREPARATION_RACE_BATCH=2` limits concurrent tuning candidates. Autotuning stays enabled; kernel artifacts remain under the mounted SSD cache. The patch checks the image's source before writing; revalidate it when upgrading the image. Run its GPU-free tests inside the image with `python overrides/test_b12x_preparation_bound.py --source-root /opt/venv/lib/python3.12/site-packages/b12x -v`.
+
+The same wrapper applies an opt-in [vLLM sequence-info patch](overrides/apply_vllm_sequence_info.py) because this image otherwise exposes `/server_info` only through development mode. With `LIL_VLLM_SEQUENCE_INFO=1`, it returns just `vllm_config.scheduler_config.max_num_seqs`; llmconduit can discover 32 slots per running replica without enabling vLLM development controls. The source match is checked and idempotent. Revalidate it on image upgrades with `python overrides/test_vllm_sequence_info.py -v` inside the exact image.
+
 DeepSeek uses disk-backed Engram tables. Qwen Flash Next TP2/TP3 use disk-backed PLE tables; TP4 disables PLE CPU offload so its tables remain on GPU. GLM 5.3 TP6 and Qwen Flash Next TP3 are labeled experimental because upstream has not published qualified recipes for those shapes.
 
 The `swift15-flash-next-nvfp4-tp4` profile serves [UkisAI Swift 1.5 Flash Next NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) as `Swift-1.5-Flash-Next-NVFP4` on port `8112`. It reuses the Qwen Flash Next TP4 runtime with PLE tables in VRAM and allocates one four-GPU PCIe group. Place the checkpoint in `/mnt/llm_stuff/models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4` before loading it. Allow port `8112` in host/container firewall rules where remote access is needed.
@@ -168,8 +172,15 @@ Full schemas are in [`openapi.yaml`](openapi.yaml).
   published host port, and loopback HTTP readiness probe to use the same port inside
   that range;
 - model ID, description, container image, command, and validated Docker restart policy;
-- environment, bind mounts, ports, static GPU request or topology-aware placement, entrypoint, network/IPC mode, security options, ulimits, and shared memory;
+- environment, bind mounts, ports, static GPU request or topology-aware placement, entrypoint, network/IPC mode, security options, ulimits, shared memory, and optional Docker memory limits;
 - an optional HTTP readiness probe.
+
+Set a model's `memory_limit` to pass Docker `--memory`; set `memory_swap_limit`
+with it to pass Docker `--memory-swap`. Use equal values such as
+`"memory_limit": "40g"` and `"memory_swap_limit": "40g"` when a workload should
+be killed inside its own container instead of growing into host swap. Docker's
+`-1` swap value is accepted for unlimited swap, but `memory_swap_limit` cannot be
+set without `memory_limit`, and finite swap must be at least the memory limit.
 
 Profiles that Fleet can co-schedule must use distinct base ports. Mutually exclusive profiles may share a port; TP8 Pro shares `8109` with TP4 Flash because it requires all GPUs. Replicas use the same inclusive `runtime.model_port_range` as a dynamic port pool, and the B12X manifest restricts model listeners to `8101` through `8121`; keep the surrounding host and container firewall rules synchronized with that range.
 

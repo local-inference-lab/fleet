@@ -308,6 +308,8 @@ func TestConcurrentPlacementAllocatesAroundRunningDeployments(t *testing.T) {
 func TestActivateInstancesScalesReplicasAndKeepsGPUAndPortsDisjoint(t *testing.T) {
 	driver := newFakeDriver()
 	manager := newReplicaTestManager(t, driver)
+	manager.manifest.Models[0].MemoryLimit = "40g"
+	manager.manifest.Models[0].MemorySwapLimit = "40g"
 
 	target := 2
 	op, noOp, err := manager.ActivateInstances("alpha", &target)
@@ -328,6 +330,23 @@ func TestActivateInstancesScalesReplicasAndKeepsGPUAndPortsDisjoint(t *testing.T
 	}
 	if reflect.DeepEqual(status.Instances[0].AssignedGPUs, status.Instances[1].AssignedGPUs) {
 		t.Fatalf("replicas used overlapping GPU assignment: %+v", status.Instances)
+	}
+	driver.mu.Lock()
+	startedModels := append([]manifest.Model(nil), driver.startedModels...)
+	driver.mu.Unlock()
+	var startedAlpha []manifest.Model
+	for _, model := range startedModels {
+		if strings.HasPrefix(model.ID, "alpha") {
+			startedAlpha = append(startedAlpha, model)
+		}
+	}
+	if len(startedAlpha) != 2 {
+		t.Fatalf("started alpha models = %+v, want two replicas", startedAlpha)
+	}
+	for _, model := range startedAlpha {
+		if model.MemoryLimit != "40g" || model.MemorySwapLimit != "40g" {
+			t.Fatalf("replica %q memory limits = %q/%q, want 40g/40g", model.ID, model.MemoryLimit, model.MemorySwapLimit)
+		}
 	}
 
 	target = 1
@@ -766,13 +785,14 @@ func intersects(left, right []int) bool {
 }
 
 type fakeDriver struct {
-	mu         sync.Mutex
-	states     map[string]deployment.ContainerState
-	calls      []string
-	blockStart chan struct{}
-	inspectErr error
-	startErr   error
-	stopErr    error
+	mu            sync.Mutex
+	states        map[string]deployment.ContainerState
+	calls         []string
+	startedModels []manifest.Model
+	blockStart    chan struct{}
+	inspectErr    error
+	startErr      error
+	stopErr       error
 }
 
 func newFakeDriver() *fakeDriver {
@@ -790,6 +810,7 @@ func (d *fakeDriver) Start(ctx context.Context, model manifest.Model, assigned [
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.calls = append(d.calls, "start:"+model.ID)
+	d.startedModels = append(d.startedModels, model)
 	if d.startErr != nil {
 		return d.startErr
 	}

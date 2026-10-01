@@ -23,12 +23,30 @@ type ContainerState struct {
 	Error        string
 	AssignedGPUs []int
 	Port         int
+
+	// Identity labels written by Fleet when it created the container.
+	Name          string
+	ModelID       string
+	InstanceID    string
+	InstanceIndex int
+	Fingerprint   string
 }
 
 type Driver interface {
 	Start(context.Context, manifest.Model, []int) error
 	Stop(context.Context, manifest.Model, bool) error
 	Inspect(context.Context, manifest.Model) (ContainerState, error)
+	// List returns every Fleet-managed container in one backend round trip so
+	// reconciliation cost does not grow with models times replicas.
+	List(context.Context) ([]ContainerState, error)
+}
+
+// ImagePuller is implemented by drivers that can fetch a missing image before
+// creating a container. Fleet calls it outside the lifecycle lock with its own,
+// longer timeout so a large pull neither blocks unrelated models nor trips the
+// container-create deadline.
+type ImagePuller interface {
+	EnsureImage(ctx context.Context, image string) error
 }
 
 // MaxMessageBytes caps operator-visible error text taken from Docker, the

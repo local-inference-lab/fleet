@@ -16,8 +16,8 @@ func TestStartPassesManifestValuesAsLiteralArguments(t *testing.T) {
 	statePath := filepath.Join(dir, "exists")
 	scriptPath := filepath.Join(dir, "docker")
 	script := `#!/bin/sh
-if [ "$1" = "inspect" ] && [ ! -f "$FAKE_DOCKER_STATE" ]; then
-  echo "error: no such object" >&2
+if [ "$1" = "container" ] && [ "$2" = "inspect" ] && [ ! -f "$FAKE_DOCKER_STATE" ]; then
+  echo "Error: No such container: $3" >&2
   exit 1
 fi
 for arg in "$@"; do
@@ -94,8 +94,8 @@ func TestStartLabelsReplicaInstanceAndUsesReplicaName(t *testing.T) {
 	statePath := filepath.Join(dir, "exists")
 	scriptPath := filepath.Join(dir, "docker")
 	script := `#!/bin/sh
-if [ "$1" = "inspect" ] && [ ! -f "$FAKE_DOCKER_STATE" ]; then
-  echo "error: no such object" >&2
+if [ "$1" = "container" ] && [ "$2" = "inspect" ] && [ ! -f "$FAKE_DOCKER_STATE" ]; then
+  echo "Error: No such container: $3" >&2
   exit 1
 fi
 for arg in "$@"; do
@@ -143,10 +143,9 @@ func TestStopRefusesUnmanagedContainer(t *testing.T) {
 	dir := t.TempDir()
 	scriptPath := filepath.Join(dir, "docker")
 	script := `#!/bin/sh
-case "$3" in
-  *json*) printf '%s\n' '{"Status":"running","Running":true,"ExitCode":0}' ;;
-  *managed*) printf '%s\n' 'false' ;;
-esac
+if [ "$1 $2" = "container inspect" ]; then
+  printf '%s\n' '[{"Name":"/lil-fleet-safe-model","State":{"Status":"running","Running":true},"Config":{"Labels":{"ai.local-inference-lab.lil-fleet.managed":"false"}}}]'
+fi
 `
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake docker: %v", err)
@@ -277,8 +276,8 @@ func writeFakeDocker(t *testing.T, dir string) string {
 	t.Helper()
 	scriptPath := filepath.Join(dir, "docker")
 	script := `#!/bin/sh
-if [ "$1" = "inspect" ] && [ ! -f "$FAKE_DOCKER_STATE" ]; then
-  echo "error: no such object" >&2
+if [ "$1" = "container" ] && [ "$2" = "inspect" ] && [ ! -f "$FAKE_DOCKER_STATE" ]; then
+  echo "Error: No such container: $3" >&2
   exit 1
 fi
 for arg in "$@"; do
@@ -319,5 +318,86 @@ func TestDockerErrorsAreSanitizedAndRedacted(t *testing.T) {
 	}
 	if len(message) > len("docker create: ")+1024 {
 		t.Fatalf("docker error length = %d, want capped", len(message))
+	}
+}
+
+func TestListUsesOneDockerPsAndOneInspect(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	scriptPath := filepath.Join(dir, "docker")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+case "$1" in
+  ps) printf 'aaa\nbbb\nccc\n' ;;
+  container)
+    # ccc vanished between ps and inspect: docker prints the rest and fails.
+    cat <<'JSON'
+[{"Name":"/lil-fleet-alpha","State":{"Status":"running","Running":true,"Health":{"Status":"healthy"}},
+  "Config":{"Labels":{"ai.local-inference-lab.lil-fleet.managed":"true","ai.local-inference-lab.lil-fleet.model":"alpha",
+  "ai.local-inference-lab.lil-fleet.instance":"alpha","ai.local-inference-lab.lil-fleet.instance_index":"1",
+  "ai.local-inference-lab.lil-fleet.port":"9001","ai.local-inference-lab.lil-fleet.gpus":"0,1",
+  "ai.local-inference-lab.lil-fleet.fingerprint":"abc"}}},
+ {"Name":"/lil-fleet-alpha--2","State":{"Status":"exited","Running":false,"ExitCode":137},
+  "Config":{"Labels":{"ai.local-inference-lab.lil-fleet.managed":"true","ai.local-inference-lab.lil-fleet.model":"alpha",
+  "ai.local-inference-lab.lil-fleet.instance":"alpha--2","ai.local-inference-lab.lil-fleet.instance_index":"2",
+  "ai.local-inference-lab.lil-fleet.port":"9002","ai.local-inference-lab.lil-fleet.gpus":"2"}}}]
+JSON
+    echo "Error: No such container: ccc" >&2
+    exit 1 ;;
+esac
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_DOCKER_LOG", logPath)
+	states, err := NewCLIDriver(scriptPath).List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v", err)
+	}
+	if len(states) != 2 {
+		t.Fatalf("List() = %+v, want two containers", states)
+	}
+	first, second := states[0], states[1]
+	if first.ModelID != "alpha" || first.InstanceIndex != 1 || first.Port != 9001 || !first.Running || first.Health != "healthy" ||
+		len(first.AssignedGPUs) != 2 || first.Fingerprint != "abc" || first.Name != "lil-fleet-alpha" {
+		t.Fatalf("first container = %+v", first)
+	}
+	if second.InstanceIndex != 2 || second.Running || second.ExitCode != 137 {
+		t.Fatalf("second container = %+v", second)
+	}
+	raw, _ := os.ReadFile(logPath)
+	calls := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(calls) != 2 || !strings.HasPrefix(calls[0], "ps --all --quiet --no-trunc --filter label=ai.local-inference-lab.lil-fleet.managed=true") ||
+		calls[1] != "container inspect aaa bbb ccc" {
+		t.Fatalf("docker calls = %q", calls)
+	}
+}
+
+func TestEnsureImagePullsOnlyMissingImages(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	scriptPath := filepath.Join(dir, "docker")
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_DOCKER_LOG"
+if [ "$1" = image ] && [ "$5" = missing/image ]; then
+  echo "Error: No such image: missing/image" >&2
+  exit 1
+fi
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_DOCKER_LOG", logPath)
+	driver := NewCLIDriver(scriptPath)
+	if err := driver.EnsureImage(context.Background(), "present/image"); err != nil {
+		t.Fatal(err)
+	}
+	if err := driver.EnsureImage(context.Background(), "missing/image"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(logPath)
+	want := "image inspect --format {{.Id}} present/image\nimage inspect --format {{.Id}} missing/image\npull --quiet missing/image\n"
+	if string(raw) != want {
+		t.Fatalf("docker calls =\n%s\nwant\n%s", raw, want)
 	}
 }

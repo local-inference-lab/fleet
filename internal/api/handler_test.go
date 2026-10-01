@@ -258,3 +258,14 @@ func (d *apiDriver) Inspect(_ context.Context, model manifest.Model) (deployment
 	state.Exists = true
 	return state, nil
 }
+
+func (d *apiDriver) List(context.Context) ([]deployment.ContainerState, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var result []deployment.ContainerState
+	for id, state := range d.states {
+		state.Exists, state.ModelID, state.InstanceID, state.InstanceIndex = true, id, id, 1
+		result = append(result, state)
+	}
+	return result, nil
+}

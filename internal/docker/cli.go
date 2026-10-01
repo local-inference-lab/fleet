@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/local-inference-lab/fleet/internal/deployment"
 	"github.com/local-inference-lab/fleet/internal/manifest"
@@ -26,6 +27,7 @@ const modelLabel = "ai.local-inference-lab.lil-fleet.model"
 const instanceLabel = "ai.local-inference-lab.lil-fleet.instance"
 const instanceIndexLabel = "ai.local-inference-lab.lil-fleet.instance_index"
 const portLabel = "ai.local-inference-lab.lil-fleet.port"
+const fingerprintLabel = "ai.local-inference-lab.lil-fleet.fingerprint"
 
 type CLIDriver struct {
 	binary string
@@ -66,6 +68,8 @@ func instanceIndex(model manifest.Model) int {
 }
 
 func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPUs []int) error {
+	ctx, cancel := withDefaultTimeout(ctx, mutateTimeout)
+	defer cancel()
 	name := containerName(model)
 	state, err := d.Inspect(ctx, model)
 	if err != nil && !errors.Is(err, deployment.ErrNotFound) {
@@ -76,8 +80,7 @@ func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPU
 		return err
 	}
 	if state.Exists {
-		actual, labelErr := d.output(ctx, "inspect", "--format", "{{ index .Config.Labels \"ai.local-inference-lab.lil-fleet.fingerprint\" }}", name)
-		if labelErr == nil && strings.TrimSpace(actual) == fingerprint && equalGPUIndices(state.AssignedGPUs, assignedGPUs) {
+		if state.Fingerprint == fingerprint && equalGPUIndices(state.AssignedGPUs, assignedGPUs) {
 			if state.Running {
 				return nil
 			}
@@ -95,7 +98,7 @@ func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPU
 		"--label", instanceLabel + "=" + instanceID(model),
 		"--label", instanceIndexLabel + "=" + strconv.Itoa(instanceIndex(model)),
 		"--label", portLabel + "=" + strconv.Itoa(model.InstancePort),
-		"--label", "ai.local-inference-lab.lil-fleet.fingerprint=" + fingerprint,
+		"--label", fingerprintLabel + "=" + fingerprint,
 		"--label", gpuLabel + "=" + joinGPUIndices(assignedGPUs),
 	}
 	envArgs, cliEnv := environmentArgs(model.Environment)
@@ -210,6 +213,8 @@ func affectsDockerCLI(key string) bool {
 }
 
 func (d *CLIDriver) Stop(ctx context.Context, model manifest.Model, remove bool) error {
+	ctx, cancel := withDefaultTimeout(ctx, mutateTimeout)
+	defer cancel()
 	name := containerName(model)
 	state, err := d.Inspect(ctx, model)
 	if errors.Is(err, deployment.ErrNotFound) {
@@ -228,22 +233,99 @@ func (d *CLIDriver) Stop(ctx context.Context, model manifest.Model, remove bool)
 		args = []string{"stop", name}
 	}
 	if _, err := d.output(ctx, args...); err != nil {
+		if isNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("stop container: %w", err)
 	}
 	return nil
 }
 
+// Inspect reads one container's state and Fleet labels with a single
+// docker container inspect call.
 func (d *CLIDriver) Inspect(ctx context.Context, model manifest.Model) (deployment.ContainerState, error) {
+	ctx, cancel := withDefaultTimeout(ctx, readTimeout)
+	defer cancel()
 	name := containerName(model)
-	raw, err := d.output(ctx, "inspect", "--format", "{{json .State}}", name)
+	raw, err := d.output(ctx, "container", "inspect", name)
 	if err != nil {
-		message := strings.ToLower(err.Error())
-		if strings.Contains(message, "no such object") || strings.Contains(message, "no such container") {
+		if isNotFound(err) {
 			return deployment.ContainerState{}, deployment.ErrNotFound
 		}
 		return deployment.ContainerState{}, fmt.Errorf("inspect container: %w", err)
 	}
-	var state struct {
+	var docs []inspectDocument
+	if err := json.Unmarshal([]byte(raw), &docs); err != nil || len(docs) != 1 {
+		return deployment.ContainerState{}, fmt.Errorf("decode docker inspect output")
+	}
+	if docs[0].Config.Labels[managedLabel] != "true" {
+		return deployment.ContainerState{}, fmt.Errorf("container %q is unmanaged", name)
+	}
+	return docs[0].state()
+}
+
+// List returns all Fleet-managed containers using one docker ps and one
+// docker container inspect, regardless of how many models or replicas exist.
+func (d *CLIDriver) List(ctx context.Context) ([]deployment.ContainerState, error) {
+	ctx, cancel := withDefaultTimeout(ctx, readTimeout)
+	defer cancel()
+	ids, err := d.output(ctx, "ps", "--all", "--quiet", "--no-trunc", "--filter", "label="+managedLabel+"=true")
+	if err != nil {
+		return nil, fmt.Errorf("list containers: %w", err)
+	}
+	fields := strings.Fields(ids)
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	raw, err := d.output(ctx, append([]string{"container", "inspect"}, fields...)...)
+	// A container removed between ps and inspect makes docker exit non-zero
+	// while still printing the remaining containers.
+	if err != nil && strings.TrimSpace(raw) == "" {
+		return nil, fmt.Errorf("inspect containers: %w", err)
+	}
+	var docs []inspectDocument
+	if decodeErr := json.Unmarshal([]byte(raw), &docs); decodeErr != nil {
+		if err != nil {
+			return nil, fmt.Errorf("inspect containers: %w", err)
+		}
+		return nil, fmt.Errorf("decode docker inspect output: %w", decodeErr)
+	}
+	states := make([]deployment.ContainerState, 0, len(docs))
+	for _, doc := range docs {
+		if doc.Config.Labels[managedLabel] != "true" {
+			continue
+		}
+		state, err := doc.state()
+		if err != nil {
+			return nil, err
+		}
+		states = append(states, state)
+	}
+	return states, nil
+}
+
+// EnsureImage pulls the image only when it is not present locally.
+func (d *CLIDriver) EnsureImage(ctx context.Context, image string) error {
+	inspectCtx, cancel := withDefaultTimeout(ctx, readTimeout)
+	_, err := d.output(inspectCtx, "image", "inspect", "--format", "{{.Id}}", image)
+	cancel()
+	if err == nil {
+		return nil
+	}
+	if !isNotFound(err) {
+		return fmt.Errorf("inspect image: %w", err)
+	}
+	pullCtx, cancel := withDefaultTimeout(ctx, defaultPullTimeout)
+	defer cancel()
+	if _, err := d.output(pullCtx, "pull", "--quiet", image); err != nil {
+		return fmt.Errorf("pull image: %w", err)
+	}
+	return nil
+}
+
+type inspectDocument struct {
+	Name  string `json:"Name"`
+	State struct {
 		Status    string `json:"Status"`
 		Running   bool   `json:"Running"`
 		ExitCode  int    `json:"ExitCode"`
@@ -252,41 +334,64 @@ func (d *CLIDriver) Inspect(ctx context.Context, model manifest.Model) (deployme
 		Health    *struct {
 			Status string `json:"Status"`
 		} `json:"Health"`
-	}
-	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &state); err != nil {
-		return deployment.ContainerState{}, fmt.Errorf("decode docker state: %w", err)
-	}
-	managed, err := d.output(ctx, "inspect", "--format", "{{ index .Config.Labels \"ai.local-inference-lab.lil-fleet.managed\" }}", name)
+	} `json:"State"`
+	Config struct {
+		Labels map[string]string `json:"Labels"`
+	} `json:"Config"`
+}
+
+func (doc inspectDocument) state() (deployment.ContainerState, error) {
+	labels := doc.Config.Labels
+	assigned, err := parseGPUIndices(strings.TrimSpace(labels[gpuLabel]))
 	if err != nil {
-		return deployment.ContainerState{}, fmt.Errorf("inspect managed label: %w", err)
+		return deployment.ContainerState{}, fmt.Errorf("inspect gpu label: %w", err)
 	}
-	if strings.TrimSpace(managed) != "true" {
-		return deployment.ContainerState{}, fmt.Errorf("container %q is unmanaged", name)
+	port, err := parsePort(strings.TrimSpace(labels[portLabel]))
+	if err != nil {
+		return deployment.ContainerState{}, fmt.Errorf("inspect port label: %w", err)
+	}
+	index := 1
+	if value := strings.TrimSpace(labels[instanceIndexLabel]); value != "" {
+		index, err = strconv.Atoi(value)
+		if err != nil || index < 1 {
+			return deployment.ContainerState{}, fmt.Errorf("invalid instance index label %q", value)
+		}
 	}
 	health := ""
-	if state.Health != nil {
-		health = state.Health.Status
-	}
-	gpus, err := d.output(ctx, "inspect", "--format", "{{ index .Config.Labels \"ai.local-inference-lab.lil-fleet.gpus\" }}", name)
-	if err != nil {
-		return deployment.ContainerState{}, fmt.Errorf("inspect gpu label: %w", err)
-	}
-	assigned, err := parseGPUIndices(strings.TrimSpace(gpus))
-	if err != nil {
-		return deployment.ContainerState{}, fmt.Errorf("inspect gpu label: %w", err)
-	}
-	portValue, err := d.output(ctx, "inspect", "--format", "{{ index .Config.Labels \"ai.local-inference-lab.lil-fleet.port\" }}", name)
-	if err != nil {
-		return deployment.ContainerState{}, fmt.Errorf("inspect port label: %w", err)
-	}
-	port, err := parsePort(strings.TrimSpace(portValue))
-	if err != nil {
-		return deployment.ContainerState{}, fmt.Errorf("inspect port label: %w", err)
+	if doc.State.Health != nil {
+		health = doc.State.Health.Status
 	}
 	return deployment.ContainerState{
-		Exists: true, Running: state.Running, Status: state.Status, Health: health,
-		ExitCode: state.ExitCode, OOMKilled: state.OOMKilled, Error: state.Error, AssignedGPUs: assigned, Port: port,
+		Exists: true, Running: doc.State.Running, Status: doc.State.Status, Health: health,
+		ExitCode: doc.State.ExitCode, OOMKilled: doc.State.OOMKilled, Error: doc.State.Error,
+		AssignedGPUs: assigned, Port: port,
+		Name: strings.TrimPrefix(doc.Name, "/"), ModelID: labels[modelLabel], InstanceID: labels[instanceLabel],
+		InstanceIndex: index, Fingerprint: labels[fingerprintLabel],
 	}, nil
+}
+
+func isNotFound(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such object") || strings.Contains(message, "no such container") ||
+		strings.Contains(message, "no such image")
+}
+
+const (
+	// readTimeout bounds inspect/ps calls that should answer immediately.
+	readTimeout = 30 * time.Second
+	// mutateTimeout bounds create/start/stop when the caller set no deadline.
+	mutateTimeout = 10 * time.Minute
+	// defaultPullTimeout bounds a pull when the caller set no deadline.
+	defaultPullTimeout = time.Hour
+)
+
+// withDefaultTimeout applies limit unless the caller already set an earlier
+// deadline, so every Docker exec is bounded even when called with Background.
+func withDefaultTimeout(ctx context.Context, limit time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= limit {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, limit)
 }
 
 func joinGPUIndices(indices []int) string {
@@ -476,7 +581,9 @@ func (d *CLIDriver) fingerprint(ctx context.Context, model manifest.Model) (stri
 		}
 		input.SeccompProfiles[profile] = hex.EncodeToString(sum[:])
 	}
-	if id, err := d.output(ctx, "image", "inspect", "--format", "{{.Id}}", model.Image); err == nil {
+	inspectCtx, cancel := withDefaultTimeout(ctx, readTimeout)
+	defer cancel()
+	if id, err := d.output(inspectCtx, "image", "inspect", "--format", "{{.Id}}", model.Image); err == nil {
 		input.ImageID = strings.TrimSpace(id)
 	}
 	encoded, err := json.Marshal(input)

@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -137,7 +138,56 @@ func Load(path string) (*Manifest, error) {
 	if err := m.validate(); err != nil {
 		return nil, err
 	}
+	if err := m.resolveSeccompProfiles(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
 	return &m, nil
+}
+
+// resolveSeccompProfiles anchors relative seccomp profile paths to the manifest
+// directory. The Docker CLI reads the profile client-side relative to its own
+// working directory, which differs between a source checkout, a systemd unit,
+// and the controller container, so a relative path would silently depend on
+// how Fleet was launched.
+func (m *Manifest) resolveSeccompProfiles(manifestDir string) error {
+	base, err := filepath.Abs(manifestDir)
+	if err != nil {
+		return fmt.Errorf("resolve manifest directory: %w", err)
+	}
+	for i := range m.Models {
+		model := &m.Models[i]
+		for j, option := range model.SecurityOpt {
+			profile, ok := SeccompProfilePath(option)
+			if !ok {
+				continue
+			}
+			if !filepath.IsAbs(profile) {
+				profile = filepath.Join(base, profile)
+			}
+			info, err := os.Stat(profile)
+			if err != nil {
+				return fmt.Errorf("model %q: seccomp profile: %w", model.ID, err)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("model %q: seccomp profile %q is not a regular file", model.ID, profile)
+			}
+			model.SecurityOpt[j] = "seccomp=" + profile
+		}
+	}
+	return nil
+}
+
+// SeccompProfilePath returns the file referenced by a seccomp security option,
+// or false for non-seccomp options and the built-in "unconfined" profile.
+func SeccompProfilePath(option string) (string, bool) {
+	name, value, ok := strings.Cut(option, "=")
+	if !ok {
+		name, value, ok = strings.Cut(option, ":")
+	}
+	if !ok || name != "seccomp" || value == "" || value == "unconfined" || value == "builtin" {
+		return "", false
+	}
+	return value, true
 }
 
 func ensureEOF(decoder *json.Decoder) error {
@@ -213,6 +263,14 @@ func (m *Manifest) validate() error {
 		if strings.TrimSpace(model.Image) == "" {
 			return fmt.Errorf("model %q: image is required", model.ID)
 		}
+		// The image is the first positional docker-create argument; a leading
+		// dash would be parsed as another Docker option.
+		if strings.HasPrefix(model.Image, "-") || strings.ContainsFunc(model.Image, unsafeArgumentRune) {
+			return fmt.Errorf("model %q: image must not start with '-' or contain whitespace or control characters", model.ID)
+		}
+		if strings.HasPrefix(model.Entrypoint, "-") {
+			return fmt.Errorf("model %q: entrypoint must not start with '-'", model.ID)
+		}
 		if model.Restart != "" && !validRestartPolicy.MatchString(model.Restart) {
 			return fmt.Errorf("model %q: invalid restart policy %q", model.ID, model.Restart)
 		}
@@ -254,6 +312,11 @@ func (m *Manifest) validate() error {
 			if !strings.HasPrefix(mount.Source, "/") || !strings.HasPrefix(mount.Target, "/") {
 				return fmt.Errorf("model %q mount %d: source and target must be absolute", model.ID, j)
 			}
+			// --mount is a comma-separated key=value list; a comma in a path
+			// would inject extra mount options such as a writable bind.
+			if strings.ContainsAny(mount.Source+mount.Target, ",\"") || strings.ContainsFunc(mount.Source+mount.Target, unsafeArgumentRune) {
+				return fmt.Errorf("model %q mount %d: source and target must not contain commas, quotes, or control characters", model.ID, j)
+			}
 		}
 		for j := range model.Ports {
 			port := &model.Ports[j]
@@ -262,6 +325,9 @@ func (m *Manifest) validate() error {
 			}
 			if port.HostIP == "" {
 				port.HostIP = "127.0.0.1"
+			}
+			if net.ParseIP(port.HostIP) == nil {
+				return fmt.Errorf("model %q port %d: host_ip must be an IP address", model.ID, j)
 			}
 			if port.Protocol == "" {
 				port.Protocol = "tcp"
@@ -304,6 +370,10 @@ func (m *Manifest) validate() error {
 	}
 	sort.Slice(m.Models, func(i, j int) bool { return m.Models[i].ID < m.Models[j].ID })
 	return nil
+}
+
+func unsafeArgumentRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || r == ' ' || r == '\t'
 }
 
 func validateMemoryLimits(model *Model) error {

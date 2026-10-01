@@ -318,7 +318,7 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 				if id == "mimo-v26-flash-mopd-tp4" {
 					wantIPC = "host"
 				}
-				if model.IPC != wantIPC || len(model.SecurityOpt) != 1 || model.SecurityOpt[0] != "seccomp=overrides/seccomp-deepseek-io-uring.json" {
+				if model.IPC != wantIPC || len(model.SecurityOpt) != 1 || model.SecurityOpt[0] != ioUringSeccompOption(t) {
 					t.Fatalf("io_uring profile IPC/security = %q/%v", model.IPC, model.SecurityOpt)
 				}
 			} else if model.IPC != "host" || len(model.SecurityOpt) != 1 || model.SecurityOpt[0] != "seccomp=unconfined" {
@@ -534,7 +534,7 @@ func TestDerivedTP4Profiles(t *testing.T) {
 		})
 	}
 	mopd, _ := cfg.Model("mimo-v26-flash-mopd-tp4")
-	if len(mopd.SecurityOpt) != 1 || mopd.SecurityOpt[0] != "seccomp=overrides/seccomp-deepseek-io-uring.json" {
+	if len(mopd.SecurityOpt) != 1 || mopd.SecurityOpt[0] != ioUringSeccompOption(t) {
 		t.Fatalf("MiMo MOPD security options = %v, want narrow io_uring profile", mopd.SecurityOpt)
 	}
 	if got := speculativeConfig(t, mopd); got["model"] != "/model/dflash" || got["draft_tensor_parallel_size"] != float64(4) {
@@ -731,5 +731,70 @@ func TestShippedManifestsKeepHostNetworkListenersOnLoopback(t *testing.T) {
 				t.Fatalf("%s %s has no explicit loopback bind", name, model.ID)
 			}
 		}
+	}
+}
+
+func ioUringSeccompOption(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.Abs(filepath.Join("..", "..", "overrides", "seccomp-deepseek-io-uring.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "seccomp=" + path
+}
+
+func TestLoadAnchorsRelativeSeccompProfilesToManifestDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "overrides"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "overrides", "profile.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "fleet.json")
+	body := `{"version": 1, "runtime": {}, "models": [
+		{"id": "a", "image": "one", "security_opt": ["seccomp=overrides/profile.json", "seccomp=unconfined", "label=disable"]}
+	]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"seccomp=" + filepath.Join(dir, "overrides", "profile.json"), "seccomp=unconfined", "label=disable"}
+	if got := cfg.Models[0].SecurityOpt; !reflect.DeepEqual(got, want) {
+		t.Fatalf("security_opt = %v, want %v", got, want)
+	}
+
+	missing := writeManifest(t, `{"version": 1, "runtime": {}, "models": [
+		{"id": "a", "image": "one", "security_opt": ["seccomp=missing.json"]}
+	]}`)
+	if _, err := Load(missing); err == nil || !strings.Contains(err.Error(), "seccomp profile") {
+		t.Fatalf("Load(missing seccomp) error = %v", err)
+	}
+}
+
+func TestLoadRejectsDockerOptionInjection(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		model   string
+		wantErr string
+	}{
+		{"image option", `"image": "--privileged"`, "image must not start with '-'"},
+		{"image whitespace", `"image": "alpine --privileged"`, "image must not start with '-'"},
+		{"entrypoint option", `"image": "one", "entrypoint": "--privileged"`, "entrypoint must not start"},
+		{"mount source comma", `"image": "one", "mounts": [{"source": "/data,readonly=false", "target": "/data", "read_only": true}]`, "must not contain commas"},
+		{"mount target comma", `"image": "one", "mounts": [{"source": "/data", "target": "/data,bind-propagation=shared"}]`, "must not contain commas"},
+		{"mount newline", `"image": "one", "mounts": [{"source": "/data\n", "target": "/data"}]`, "must not contain commas"},
+		{"publish host ip", `"image": "one", "ports": [{"host_ip": "0.0.0.0:1:1/tcp,", "host_port": 1, "container_port": 1}]`, "host_ip must be an IP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeManifest(t, `{"version": 1, "runtime": {}, "models": [{"id": "a", `+tc.model+`}]}`))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }

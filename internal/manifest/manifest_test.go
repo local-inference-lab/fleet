@@ -648,3 +648,88 @@ func TestMiMoProEncoderDriverCompatibility(t *testing.T) {
 		t.Fatalf("MiMo Pro encoder attention backend = %q, want TRITON_ATTN for driver compatibility", got)
 	}
 }
+
+func TestHostNetworkRejectsPublicOrImplicitBinds(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		model   string
+		wantErr string
+	}{
+		{"wildcard", `"command": ["serve", "--host", "0.0.0.0"]`, `--host "0.0.0.0"`},
+		{"ipv6 wildcard with equals", `"command": ["serve", "--host=::"]`, `--host "::"`},
+		{"routable address", `"command": ["serve", "--host", "192.168.1.10"]`, "every host interface"},
+		{"second bind overrides loopback", `"command": ["serve", "--host", "127.0.0.1", "--host=0.0.0.0"]`, `--host "0.0.0.0"`},
+		{"dangling flag", `"command": ["serve", "--host"]`, "--host requires a value"},
+		{"wildcard HOST environment", `"command": ["serve", "--host", "127.0.0.1"], "environment": {"HOST": "0.0.0.0"}`, `HOST="0.0.0.0"`},
+		{"implicit default bind", `"command": ["serve", "--port", "8101"]`, "requires an explicit loopback bind"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeManifest(t, `{
+				"version": 1,
+				"runtime": {},
+				"models": [{"id": "a", "image": "one", "network_mode": "host", `+tc.model+`}]
+			}`))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestHostNetworkAllowsLoopbackBinds(t *testing.T) {
+	for _, bind := range []string{
+		`"command": ["serve", "--host", "127.0.0.1"]`,
+		`"command": ["serve", "--host", "127.0.0.2"]`,
+		`"command": ["serve", "--host=::1"]`,
+		`"command": ["serve", "--host", "[::1]"]`,
+		`"command": ["serve", "--host", "localhost"]`,
+		`"command": ["serve"], "environment": {"HOST": "127.0.0.1"}`,
+	} {
+		t.Run(bind, func(t *testing.T) {
+			loadManifest(t, `{
+				"version": 1,
+				"runtime": {},
+				"models": [{"id": "a", "image": "one", "network_mode": "host", `+bind+`}]
+			}`)
+		})
+	}
+	// Bridge networking publishes through Docker's loopback-default port
+	// mapping, so a container-local wildcard bind remains valid.
+	loadManifest(t, `{
+		"version": 1,
+		"runtime": {},
+		"models": [{"id": "a", "image": "one", "command": ["serve", "--host", "0.0.0.0"]}]
+	}`)
+}
+
+func TestShippedManifestsKeepHostNetworkListenersOnLoopback(t *testing.T) {
+	for _, name := range []string{"fleet.b12x.json", "fleet.example.json"} {
+		cfg, err := Load(filepath.Join("..", "..", name))
+		if err != nil {
+			t.Fatalf("Load(%s) error = %v", name, err)
+		}
+		for _, model := range cfg.Models {
+			if model.NetworkMode != "host" {
+				continue
+			}
+			binds := 0
+			for index, argument := range model.Command {
+				if argument == "--host" && index+1 < len(model.Command) {
+					binds++
+					if model.Command[index+1] != "127.0.0.1" {
+						t.Fatalf("%s %s binds %q", name, model.ID, model.Command[index+1])
+					}
+				}
+			}
+			if host, ok := model.Environment["HOST"]; ok {
+				binds++
+				if host != "127.0.0.1" {
+					t.Fatalf("%s %s HOST=%q", name, model.ID, host)
+				}
+			}
+			if binds == 0 {
+				t.Fatalf("%s %s has no explicit loopback bind", name, model.ID)
+			}
+		}
+	}
+}

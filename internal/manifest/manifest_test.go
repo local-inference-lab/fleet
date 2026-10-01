@@ -469,12 +469,27 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if got := commandArgValue(t, pro.Command, "--max-num-scheduled-tokens"); got != "2048" {
 		t.Fatalf("MiMo Pro max scheduled tokens = %q, want 2048", got)
 	}
+	if len(pro.Command) < 2 || pro.Command[0] != "serve" || pro.Command[1] != "/model" {
+		t.Fatalf("MiMo Pro command model path = %v, want serve /model", pro.Command)
+	}
+	if commandHasArg(pro.Command, "--load-format") {
+		t.Fatalf("MiMo Pro must use the standard lazy safetensors loader, not a --load-format override: %v", pro.Command)
+	}
+	if got, flash := commandArgValue(t, pro.Command, "--port"), commandArgValue(t, mimo.Command, "--port"); got != "8109" || got != flash {
+		t.Fatalf("MiMo Pro port = %q and Flash port = %q, want shared 8109 guarded by TP8 full-GPU placement", got, flash)
+	}
+	if pro.Environment["CUDA_VISIBLE_DEVICES"] != "0,1,2,3,4,5,6,7" {
+		t.Fatalf("MiMo Pro CUDA_VISIBLE_DEVICES = %q, want all eight logical GPUs", pro.Environment["CUDA_VISIBLE_DEVICES"])
+	}
 	if len(pro.Mounts) == 0 || pro.Mounts[0].Source != "/mnt/llm_stuff/models/MiMo-V2.6-Pro-RL" || pro.Mounts[0].Target != "/model" || !pro.Mounts[0].ReadOnly {
 		t.Fatalf("MiMo Pro model mount = %+v, want read-only Pro checkpoint at /model", pro.Mounts)
 	}
 	proSpeculative := speculativeConfig(t, pro)
 	if proSpeculative["model"] != "/model/dflash" {
 		t.Fatalf("MiMo Pro draft path = %v, want /model/dflash", proSpeculative["model"])
+	}
+	if proSpeculative["method"] != "dflash" || proSpeculative["num_speculative_tokens"] != float64(7) {
+		t.Fatalf("MiMo Pro speculative method/tokens = %v/%v, want dflash/7", proSpeculative["method"], proSpeculative["num_speculative_tokens"])
 	}
 	if proSpeculative["draft_tensor_parallel_size"] != float64(8) {
 		t.Fatalf("MiMo Pro draft TP = %v, want TP8", proSpeculative["draft_tensor_parallel_size"])
@@ -543,6 +558,15 @@ func commandArgValue(t *testing.T, command []string, name string) string {
 	}
 	t.Fatalf("command missing %s: %v", name, command)
 	return ""
+}
+
+func commandHasArg(command []string, name string) bool {
+	for _, argument := range command {
+		if argument == name || strings.HasPrefix(argument, name+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func speculativeConfig(t *testing.T, model Model) map[string]any {

@@ -25,13 +25,16 @@ for arg in "$@"; do
 done
 if [ "$1" = "create" ]; then
   : > "$FAKE_DOCKER_STATE"
+  printf '%s' "$TOKEN" > "$FAKE_DOCKER_ENV"
 fi
 `
 	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write fake docker: %v", err)
 	}
+	envPath := filepath.Join(dir, "env.log")
 	t.Setenv("FAKE_DOCKER_LOG", logPath)
 	t.Setenv("FAKE_DOCKER_STATE", statePath)
+	t.Setenv("FAKE_DOCKER_ENV", envPath)
 
 	driver := NewCLIDriver(scriptPath)
 	model := manifest.Model{
@@ -60,7 +63,7 @@ fi
 	}
 	args := strings.Split(strings.TrimSpace(string(raw)), "\n")
 	for _, want := range []string{
-		"create", "--name", "lil-fleet-safe-model", "--env", "TOKEN=value with spaces; still literal",
+		"create", "--name", "lil-fleet-safe-model", "--env", "TOKEN",
 		"--label", "ai.local-inference-lab.lil-fleet.model=safe-model",
 		"--label", "ai.local-inference-lab.lil-fleet.instance=safe-model",
 		"--label", "ai.local-inference-lab.lil-fleet.instance_index=1",
@@ -76,6 +79,12 @@ fi
 		if !contains(args, want) {
 			t.Fatalf("Docker args missing %q:\n%s", want, raw)
 		}
+	}
+	if strings.Contains(string(raw), "value with spaces") {
+		t.Fatalf("environment value leaked onto Docker argv:\n%s", raw)
+	}
+	if env, err := os.ReadFile(envPath); err != nil || string(env) != "value with spaces; still literal" {
+		t.Fatalf("docker create environment TOKEN = %q, %v", env, err)
 	}
 }
 
@@ -283,4 +292,32 @@ fi
 		t.Fatalf("write fake docker: %v", err)
 	}
 	return scriptPath
+}
+
+func TestEnvironmentArgsKeepDockerCLISettingsOnArgv(t *testing.T) {
+	args, env := environmentArgs(map[string]string{"API_KEY": "secret", "DOCKER_HOST": "unix:///x", "HOME": "/root", "http_proxy": "http://p"})
+	wantArgs := []string{"--env", "API_KEY", "--env", "DOCKER_HOST=unix:///x", "--env", "HOME=/root", "--env", "http_proxy=http://p"}
+	if strings.Join(args, " ") != strings.Join(wantArgs, " ") || strings.Join(env, " ") != "API_KEY=secret" {
+		t.Fatalf("environmentArgs = %q / %q", args, env)
+	}
+}
+
+func TestDockerErrorsAreSanitizedAndRedacted(t *testing.T) {
+	dir := t.TempDir()
+	scriptPath := filepath.Join(dir, "docker")
+	script := "#!/bin/sh\nprintf 'bad \\033[31mvalue hunter2-secret\\nforged line %0900d' 0 >&2\nprintf 'x%.0s' $(seq 1 2000) >&2\nexit 1\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, err := NewCLIDriver(scriptPath).run(context.Background(), nil, []string{"hunter2-secret"}, "create")
+	if err == nil {
+		t.Fatal("run() unexpectedly succeeded")
+	}
+	message := err.Error()
+	if strings.Contains(message, "hunter2-secret") || strings.ContainsAny(message, "\x1b\n") || !strings.Contains(message, "[redacted]") {
+		t.Fatalf("unsanitized docker error: %q", message)
+	}
+	if len(message) > len("docker create: ")+1024 {
+		t.Fatalf("docker error length = %d, want capped", len(message))
+	}
 }

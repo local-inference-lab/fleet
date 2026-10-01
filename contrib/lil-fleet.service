@@ -1,0 +1,50 @@
+# Recommended: run Fleet directly on the GPU host as an unprivileged user in the
+# docker group. Install the binary and manifest, then:
+#   sudo install -m 0600 -o fleet -g fleet api-token /etc/lil-fleet/api-token
+#   sudo systemctl enable --now lil-fleet
+# Membership in the docker group is root-equivalent; the sandboxing below limits
+# what the Fleet process itself can do, not what Docker can.
+[Unit]
+Description=lil-fleet local inference control plane
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+User=fleet
+Group=fleet
+SupplementaryGroups=docker
+WorkingDirectory=/opt/lil-fleet
+LoadCredential=api-token:/etc/lil-fleet/api-token
+ExecStart=/opt/lil-fleet/lil-fleet -manifest /opt/lil-fleet/fleet.json -token-file ${CREDENTIALS_DIRECTORY}/api-token
+Environment=DOCKER_CONFIG=%t/lil-fleet/docker
+RuntimeDirectory=lil-fleet
+Restart=on-failure
+RestartSec=5s
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+# Per-model cache roots Fleet may create <source>/<model-id> under.
+ReadWritePaths=-/srv/fleet/cache
+
+[Install]
+WantedBy=multi-user.target

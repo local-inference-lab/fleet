@@ -21,6 +21,8 @@ var (
 	reservedReplicaID  = regexp.MustCompile(`--([2-9]|[1-5][0-9]|6[0-4])$`)
 	validRestartPolicy = regexp.MustCompile(`^(no|always|unless-stopped|on-failure(:[1-9][0-9]*)?)$`)
 	validMemoryLimit   = regexp.MustCompile(`^[1-9][0-9]*[bBkKmMgGtTpP]?$`)
+	validCapability    = regexp.MustCompile(`^(CAP_)?[A-Z][A-Z0-9_]*$`)
+	validUser          = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)?$`)
 )
 
 type Manifest struct {
@@ -79,6 +81,9 @@ type Model struct {
 	Restart         string            `json:"restart,omitempty"`
 	Init            bool              `json:"init,omitempty"`
 	Privileged      bool              `json:"privileged,omitempty"`
+	CapAdd          []string          `json:"cap_add,omitempty"`
+	User            string            `json:"user,omitempty"`
+	ReadOnly        bool              `json:"read_only,omitempty"`
 	StopTimeout     string            `json:"stop_timeout,omitempty"`
 	Readiness       *Readiness        `json:"readiness,omitempty"`
 	stopTimeout     time.Duration
@@ -98,6 +103,9 @@ type Mount struct {
 	Source   string `json:"source"`
 	Target   string `json:"target"`
 	ReadOnly bool   `json:"read_only,omitempty"`
+	// PerModel binds <source>/<model-id> instead of the shared source so
+	// writable caches are not shared between profiles.
+	PerModel bool `json:"per_model,omitempty"`
 }
 
 type Port struct {
@@ -277,6 +285,9 @@ func (m *Manifest) validate() error {
 		if err := validateMemoryLimits(model); err != nil {
 			return err
 		}
+		if err := validateContainerIdentity(model); err != nil {
+			return err
+		}
 		if model.StopTimeout != "" {
 			model.stopTimeout, err = parseStopTimeout(model.StopTimeout)
 			if err != nil {
@@ -311,6 +322,9 @@ func (m *Manifest) validate() error {
 		for j, mount := range model.Mounts {
 			if !strings.HasPrefix(mount.Source, "/") || !strings.HasPrefix(mount.Target, "/") {
 				return fmt.Errorf("model %q mount %d: source and target must be absolute", model.ID, j)
+			}
+			if mount.PerModel && mount.ReadOnly {
+				return fmt.Errorf("model %q mount %d: per_model applies only to writable mounts", model.ID, j)
 			}
 			// --mount is a comma-separated key=value list; a comma in a path
 			// would inject extra mount options such as a writable bind.
@@ -369,6 +383,23 @@ func (m *Manifest) validate() error {
 		}
 	}
 	sort.Slice(m.Models, func(i, j int) bool { return m.Models[i].ID < m.Models[j].ID })
+	return nil
+}
+
+func validateContainerIdentity(model *Model) error {
+	for _, capability := range model.CapAdd {
+		if !validCapability.MatchString(capability) || strings.TrimPrefix(capability, "CAP_") == "ALL" {
+			return fmt.Errorf("model %q: cap_add entry %q must name one Linux capability; use privileged for all capabilities", model.ID, capability)
+		}
+	}
+	if model.User != "" && !validUser.MatchString(model.User) {
+		return fmt.Errorf("model %q: user must be a name or uid with an optional :group", model.ID)
+	}
+	for key, value := range model.Environment {
+		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsFunc(key, unsafeArgumentRune) || strings.ContainsRune(value, 0) {
+			return fmt.Errorf("model %q: environment key %q is not a valid variable name", model.ID, key)
+		}
+	}
 	return nil
 }
 

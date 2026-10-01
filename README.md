@@ -176,7 +176,7 @@ Full schemas are in [`openapi.yaml`](openapi.yaml).
   published host port, and loopback HTTP readiness probe to use the same port inside
   that range;
 - model ID, description, container image, command, and validated Docker restart policy;
-- environment, bind mounts, ports, static GPU request or topology-aware placement, entrypoint, network/IPC mode, security options, ulimits, shared memory, and optional Docker memory limits;
+- environment, bind mounts (optionally `per_model`), ports, static GPU request or topology-aware placement, entrypoint, network/IPC mode, security options, `cap_add`, `user`, `read_only`, ulimits, shared memory, and optional Docker memory limits;
 - an optional HTTP readiness probe.
 
 Set a model's `memory_limit` to pass Docker `--memory`; set `memory_swap_limit`
@@ -187,6 +187,41 @@ be killed inside its own container instead of growing into host swap. Docker's
 set without `memory_limit`, and finite swap must be at least the memory limit.
 
 Profiles with `network_mode: "host"` skip Docker port publishing, so whatever address the server binds is reachable from every network the host joins, without authentication. Fleet therefore rejects a host-networked profile unless it binds loopback explicitly: every `--host`/`--host=` argument and any `HOST` environment value must be `127.0.0.0/8`, `::1`, or `localhost`, and at least one of them must be present, because vLLM, lil-serve, and the GLM serve scripts all default to `0.0.0.0`. The B12X profiles pass `--host 127.0.0.1` (or `HOST=127.0.0.1` for `glm53-tp8`, whose entrypoint reads `HOST`). Local consumers such as the llmconduit worker, including a rootless container that reaches host loopback through `slirp4netns:allow_host_loopback`, are unaffected. Bridge-networked profiles such as those in `fleet.example.json` keep `--host 0.0.0.0` inside the container and publish only to `127.0.0.1` by default.
+
+### Container hardening
+
+Fleet starts every non-privileged model container with `--cap-drop ALL` and
+`--security-opt no-new-privileges=true`. GPU access is unaffected because the
+NVIDIA runtime hook configures devices outside the container's capability set.
+Profiles opt back in narrowly:
+
+- `cap_add`: individual Linux capabilities (for example `["DAC_OVERRIDE"]`);
+  `ALL` is rejected, so use `privileged` when a profile really needs everything;
+- `user`: run as a uid/name with an optional `:group`;
+- `read_only`: mount the root filesystem read-only with a private `/tmp` tmpfs;
+- a `security_opt` entry such as `no-new-privileges=false` replaces the default.
+
+`privileged: true` profiles (such as `glm53-tp8`) receive none of these defaults.
+Without capabilities, container root obeys ordinary file permissions, so a
+writable mount must be owned by the container user or the profile must add
+`DAC_OVERRIDE`. The B12X cache root `/mnt/llm_stuff/cache` is owner-only and
+owned by the host user, so its non-privileged profiles add only `DAC_OVERRIDE`.
+
+A writable mount with `"per_model": true` binds `<source>/<model-id>` instead of
+the shared source. The container target is unchanged, so environment paths such
+as `VLLM_CACHE_ROOT=/cache/mimo-v26-pro` and `B12X_COMPILE_CACHE_DIR=/cache/b12x`
+keep working while each profile gets its own cache tree (replicas share their
+profile's directory). Fleet creates the subdirectory with mode `0700` when it can
+see the parent path; otherwise create it on the Docker host before loading. The
+B12X manifest marks every `/mnt/llm_stuff/cache` mount `per_model`, so the first
+load of each profile after upgrading starts with a cold compile/tuning cache
+unless you seed it, for example
+`sudo cp -a /mnt/llm_stuff/cache/b12x /mnt/llm_stuff/cache/<model-id>/`.
+
+Container fingerprints cover the profile, these hardening defaults, the contents
+of referenced seccomp profiles, and the local image ID. A container whose
+fingerprint changed is recreated the next time it is started; running containers
+are left alone until they are unloaded.
 
 Profiles that Fleet can co-schedule must use distinct base ports. Mutually exclusive profiles may share a port; TP8 Pro shares `8109` with TP4 Flash because it requires all GPUs. Replicas use the same inclusive `runtime.model_port_range` as a dynamic port pool, and the B12X manifest restricts model listeners to `8101` through `8121`; keep the surrounding host and container firewall rules synchronized with that range.
 

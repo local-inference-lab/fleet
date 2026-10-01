@@ -41,6 +41,8 @@ type RuntimeConfig struct {
 	PollInterval          string      `json:"poll_interval"`
 	OperationTimeout      string      `json:"operation_timeout"`
 	ReadinessTimeout      string      `json:"readiness_timeout"`
+	StopTimeout           string      `json:"stop_timeout,omitempty"`
+	PullTimeout           string      `json:"pull_timeout,omitempty"`
 	RemoveOnUnload        bool        `json:"remove_on_unload"`
 	ConcurrentDeployments bool        `json:"concurrent_deployments,omitempty"`
 	GPUTopology           GPUTopology `json:"gpu_topology,omitempty"`
@@ -48,6 +50,8 @@ type RuntimeConfig struct {
 	pollInterval          time.Duration
 	operationTimeout      time.Duration
 	readinessTimeout      time.Duration
+	stopTimeout           time.Duration
+	pullTimeout           time.Duration
 }
 
 type PortRange struct {
@@ -228,6 +232,12 @@ func (m *Manifest) validate() error {
 	}
 	if m.Runtime.readinessTimeout, err = durationOrDefault(m.Runtime.ReadinessTimeout, 10*time.Minute); err != nil {
 		return fmt.Errorf("runtime.readiness_timeout: %w", err)
+	}
+	if m.Runtime.stopTimeout, err = durationOrDefault(m.Runtime.StopTimeout, m.Runtime.operationTimeout); err != nil {
+		return fmt.Errorf("runtime.stop_timeout: %w", err)
+	}
+	if m.Runtime.pullTimeout, err = durationOrDefault(m.Runtime.PullTimeout, 30*time.Minute); err != nil {
+		return fmt.Errorf("runtime.pull_timeout: %w", err)
 	}
 	if len(m.Models) == 0 {
 		return errors.New("manifest must define at least one model")
@@ -601,6 +611,21 @@ func parseStopTimeout(value string) (time.Duration, error) {
 func (r RuntimeConfig) PollDuration() time.Duration      { return r.pollInterval }
 func (r RuntimeConfig) OperationDuration() time.Duration { return r.operationTimeout }
 func (r RuntimeConfig) ReadinessDuration() time.Duration { return r.readinessTimeout }
+func (r RuntimeConfig) PullDuration() time.Duration      { return r.pullTimeout }
+
+// StopDuration bounds one docker stop/rm for model. It is at least the model's
+// own Docker stop timeout plus a grace period, so Fleet never abandons a stop
+// that Docker is still allowed to wait for.
+func (r RuntimeConfig) StopDuration(model Model) time.Duration {
+	limit := r.stopTimeout
+	if limit == 0 {
+		limit = r.operationTimeout
+	}
+	if minimum := time.Duration(model.StopTimeoutSeconds())*time.Second + 15*time.Second; model.StopTimeoutSeconds() > 0 && limit < minimum {
+		return minimum
+	}
+	return limit
+}
 
 func (m Model) StopTimeoutSeconds() int {
 	d := m.stopTimeout

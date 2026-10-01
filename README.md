@@ -26,13 +26,53 @@ curl -H "Authorization: Bearer $(cat .secrets/api-token)" http://127.0.0.1:8090/
 
 The example model images are illustrative floating tags. For a reproducible deployment, replace them with image digests, pin model revisions in each command, and use host paths that exist on the Docker daemon host.
 
-The included Compose service can run the controller in Docker, but mounting the Docker socket gives it host-level control. Its manifest is mounted read-only:
+### Running on the host (recommended)
+
+[`contrib/lil-fleet.service`](contrib/lil-fleet.service) is a hardened systemd
+unit: an unprivileged `fleet` user in the `docker` group, the token delivered as
+a systemd credential, no capabilities, a read-only view of the filesystem except
+the per-model cache roots, and a `@system-service` syscall filter. Adjust paths
+and `ReadWritePaths` to your manifest. Docker group membership is still
+root-equivalent; the unit limits the Fleet process, not what Docker will do on
+its behalf.
+
+### Running the controller in Docker
+
+[`compose.yaml`](compose.yaml) runs Fleet without the Docker socket. A
+[socket-proxy](https://github.com/wollomatic/socket-proxy) sidecar with no
+network opens the socket and exposes a filtered unix socket that Fleet uses via
+`DOCKER_HOST`. It allows only `_ping`, `version`, container list/inspect/
+create/start/stop/delete, and image inspect/pull; exec, build, volume, network,
+system, and swarm APIs are refused. `-allowbindmountfrom` additionally limits
+bind-mount sources to `FLEET_ALLOWED_BIND_ROOTS` (comma-separated; include every
+manifest mount root and per-model cache root). This narrows a compromised Fleet's
+reach but is not a sandbox: Fleet must create GPU containers, and the manifest
+can still ask for privileged ones.
 
 ```sh
+export DOCKER_GID=$(getent group docker | cut -d: -f3)
+export FLEET_UID=$(id -u) FLEET_GID=$(id -g)
+export FLEET_ALLOWED_BIND_ROOTS=/srv/fleet
 docker compose up -d --build
 ```
 
-When using Compose, set `api.listen` to `0.0.0.0:8090` inside `fleet.json`. Bind the published API port to loopback or put authentication and TLS in front of it.
+Both containers run read-only, with all capabilities dropped and
+`no-new-privileges`; the Fleet image runs as a non-root user. Notes:
+
+- Fleet uses host networking because readiness URLs must be loopback
+  (`127.0.0.1:<port>`). With bridge networking, `127.0.0.1` would be the Fleet
+  container itself and every probe would fail. Keep `api.listen` on
+  `127.0.0.1:8090`; Fleet refuses a non-loopback listen without a token.
+- Relative `seccomp=` paths resolve against the manifest directory
+  (`/etc/lil-fleet`), and the Docker CLI reads the profile inside the Fleet
+  container, so the compose file mounts `./overrides` at
+  `/etc/lil-fleet/overrides`.
+- To let Fleet create `per_model` cache directories, mount each cache root at its
+  host path; otherwise create the directories on the host.
+- The manifest is a single-file bind mount. Editors that replace the file (new
+  inode) are not seen inside the container; edit in place or restart.
+- If a new Docker CLI version needs another endpoint, run the proxy once with
+  `-loglevel=DEBUG` to see the denied request.
 
 ## API
 

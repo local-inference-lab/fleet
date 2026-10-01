@@ -348,8 +348,11 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if !ok {
 		t.Fatal("GLM 5.3 TP8 profile missing")
 	}
-	if glm53.Image != "joninco/vllm:glm53-b12x686450b7-vllm5b28d30b59-r27" || glm53.Entrypoint != "" {
-		t.Fatalf("GLM 5.3 TP8 image/entrypoint = %q/%q", glm53.Image, glm53.Entrypoint)
+	// The sequence-info wrapper runs the image's own launcher as its first argument.
+	if glm53.Image != "joninco/vllm:glm53-b12x686450b7-vllm5b28d30b59-r27" ||
+		glm53.Entrypoint != "/opt/lil/fleet-overrides/lil-serve-sequence-info.sh" ||
+		len(glm53.Command) == 0 || glm53.Command[0] != "/opt/glm53-flash/vllm/serve-glm53.sh" {
+		t.Fatalf("GLM 5.3 TP8 image/entrypoint/launcher = %q/%q/%v", glm53.Image, glm53.Entrypoint, glm53.Command)
 	}
 	if glm53.Environment["PORT"] != "8104" || glm53.Environment["SERVED_MODEL_NAME"] != "GLM-5.3-NVFP4" || commandArgValue(t, glm53.Command, "--port") != "8104" {
 		t.Fatalf("GLM 5.3 TP8 serving settings = port %q, model %q, command %v", glm53.Environment["PORT"], glm53.Environment["SERVED_MODEL_NAME"], glm53.Command)
@@ -379,7 +382,9 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if !glm53.Privileged || glm53.StopTimeoutSeconds() != 120 || glm53.NetworkMode != "host" || glm53.IPC != "host" {
 		t.Fatalf("GLM 5.3 TP8 container settings = privileged %v, stop %d, network %q, IPC %q", glm53.Privileged, glm53.StopTimeoutSeconds(), glm53.NetworkMode, glm53.IPC)
 	}
-	if len(glm53.Mounts) != 4 || glm53.Mounts[0].Source != "/mnt/llm_stuff/models/GLM-5.3-NVFP4" || glm53.Mounts[0].Target != glm53.Environment["MODEL"] || !glm53.Mounts[0].ReadOnly || glm53.Mounts[3].Target != glm53.Environment["MODEL"]+"/config.json" || !glm53.Mounts[3].ReadOnly {
+	// Mounts 0-3 are the model, caches and config overlay; 4-5 are the read-only sequence-info overrides.
+	if len(glm53.Mounts) != 6 || glm53.Mounts[4].Target != "/opt/lil/fleet-overrides/apply_vllm_sequence_info.py" || !glm53.Mounts[4].ReadOnly ||
+		glm53.Mounts[5].Target != "/opt/lil/fleet-overrides/lil-serve-sequence-info.sh" || !glm53.Mounts[5].ReadOnly || glm53.Mounts[0].Source != "/mnt/llm_stuff/models/GLM-5.3-NVFP4" || glm53.Mounts[0].Target != glm53.Environment["MODEL"] || !glm53.Mounts[0].ReadOnly || glm53.Mounts[3].Target != glm53.Environment["MODEL"]+"/config.json" || !glm53.Mounts[3].ReadOnly {
 		t.Fatalf("GLM 5.3 TP8 model mounts = %+v", glm53.Mounts)
 	}
 	if glm53.Mounts[1].Source != "/opt/lil-fleet/.cache/glm53-r27/jit" || glm53.Mounts[2].Source != "/opt/lil-fleet/.cache/glm53-r27/container-tmp" {
@@ -469,8 +474,9 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if got := commandArgValue(t, pro.Command, "--max-num-scheduled-tokens"); got != "2048" {
 		t.Fatalf("MiMo Pro max scheduled tokens = %q, want 2048", got)
 	}
-	if len(pro.Command) < 2 || pro.Command[0] != "serve" || pro.Command[1] != "/model" {
-		t.Fatalf("MiMo Pro command model path = %v, want serve /model", pro.Command)
+	// Command[0] is the image's own launcher, run by the sequence-info wrapper.
+	if len(pro.Command) < 3 || pro.Command[0] != "/opt/venv/bin/vllm" || pro.Command[1] != "serve" || pro.Command[2] != "/model" {
+		t.Fatalf("MiMo Pro command model path = %v, want /opt/venv/bin/vllm serve /model", pro.Command)
 	}
 	if commandHasArg(pro.Command, "--load-format") {
 		t.Fatalf("MiMo Pro must use the standard lazy safetensors loader, not a --load-format override: %v", pro.Command)
@@ -864,5 +870,37 @@ func TestRuntimeStopAndPullTimeouts(t *testing.T) {
 	}
 	if _, err := Load(writeManifest(t, `{"version": 1, "runtime": {"stop_timeout": "0s"}, "models": [{"id": "a", "image": "one"}]}`)); err == nil {
 		t.Fatal("zero stop_timeout accepted")
+	}
+}
+
+// Every vLLM profile must expose /server_info so llmconduit mesh workers with
+// capacity_source: vllm advertise it; each keeps its original launcher.
+func TestEveryProfileExposesSequenceInfo(t *testing.T) {
+	cfg, err := Load("../../fleet.b12x.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range cfg.Models {
+		if model.Environment["LIL_VLLM_SEQUENCE_INFO"] != "1" {
+			t.Errorf("%s: LIL_VLLM_SEQUENCE_INFO not enabled", model.ID)
+		}
+		if model.ID == "ds41-flash-tp4-ssd" {
+			continue // its B12X preparation wrapper also applies the patch
+		}
+		if model.Entrypoint != "/opt/lil/fleet-overrides/lil-serve-sequence-info.sh" || len(model.Command) == 0 ||
+			!strings.HasPrefix(model.Command[0], "/") {
+			t.Errorf("%s: entrypoint %q command %v, want the sequence-info wrapper then the original launcher", model.ID, model.Entrypoint, model.Command)
+		}
+		mounted := map[string]bool{}
+		for _, m := range model.Mounts {
+			if m.ReadOnly {
+				mounted[m.Target] = true
+			}
+		}
+		for _, target := range []string{"/opt/lil/fleet-overrides/apply_vllm_sequence_info.py", "/opt/lil/fleet-overrides/lil-serve-sequence-info.sh"} {
+			if !mounted[target] {
+				t.Errorf("%s: %s not mounted read-only", model.ID, target)
+			}
+		}
 	}
 }

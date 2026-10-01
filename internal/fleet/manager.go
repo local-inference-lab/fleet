@@ -710,7 +710,7 @@ func (m *Manager) finishOperation(id string, err error) {
 	op.State = "succeeded"
 	if err != nil {
 		op.State = "failed"
-		op.Error = err.Error()
+		op.Error = m.sanitizeLocked(op.ModelID, err.Error())
 	}
 	op.FinishedAt = &now
 	m.operations[id] = op
@@ -928,7 +928,7 @@ func (m *Manager) probeInstance(parent context.Context, model manifest.Model, ru
 	}
 	if err != nil {
 		status.Phase = PhaseUnknown
-		status.LastError = err.Error()
+		status.LastError = sanitizeFor(model, err.Error())
 		return status, true
 	}
 	status.Container = state.Status
@@ -936,7 +936,7 @@ func (m *Manager) probeInstance(parent context.Context, model manifest.Model, ru
 	status.ExitCode = state.ExitCode
 	status.OOMKilled = state.OOMKilled
 	status.AssignedGPUs = append([]int(nil), state.AssignedGPUs...)
-	status.LastError = state.Error
+	status.LastError = sanitizeFor(model, state.Error)
 	if !state.Running {
 		status.Phase = PhaseUnloaded
 		if state.ExitCode != 0 || state.OOMKilled || state.Error != "" {
@@ -952,13 +952,13 @@ func (m *Manager) probeInstance(parent context.Context, model manifest.Model, ru
 		request, requestErr := http.NewRequestWithContext(parent, http.MethodGet, instanceModel.Readiness.URL, nil)
 		if requestErr != nil {
 			status.Phase = PhaseUnhealthy
-			status.LastError = requestErr.Error()
+			status.LastError = sanitizeFor(model, requestErr.Error())
 			return status, true
 		}
 		response, requestErr := m.client.Do(request)
 		if requestErr != nil {
 			status.Phase = PhaseUnhealthy
-			status.LastError = requestErr.Error()
+			status.LastError = sanitizeFor(model, requestErr.Error())
 			return status, true
 		}
 		response.Body.Close()
@@ -999,7 +999,7 @@ func (m *Manager) setFailure(modelID string, err error) {
 	m.mu.Lock()
 	status := m.statuses[modelID]
 	status.Phase = PhaseFailed
-	status.LastError = err.Error()
+	status.LastError = m.sanitizeLocked(modelID, err.Error())
 	status.LastChecked = time.Now().UTC()
 	m.statuses[modelID] = status
 	m.mu.Unlock()
@@ -1011,7 +1011,7 @@ func (m *Manager) setInstancePhase(modelID string, index int, phase Phase, err s
 	for i := range status.Instances {
 		if status.Instances[i].Index == index {
 			status.Instances[i].Phase = phase
-			status.Instances[i].LastError = err
+			status.Instances[i].LastError = m.sanitizeLocked(modelID, err)
 			status.Instances[i].LastChecked = time.Now().UTC()
 			break
 		}
@@ -1056,4 +1056,21 @@ func (m *Manager) stopAllInstances(ctx context.Context, model manifest.Model, re
 		}
 	}
 	return nil
+}
+
+// sanitizeLocked prepares Docker, runtime, or probe error text for the API by
+// redacting the model's manifest environment values and bounding its size.
+func (m *Manager) sanitizeLocked(modelID, message string) string {
+	if message == "" {
+		return ""
+	}
+	model, _ := m.manifest.Model(modelID)
+	return sanitizeFor(model, message)
+}
+
+func sanitizeFor(model manifest.Model, message string) string {
+	if message == "" {
+		return ""
+	}
+	return deployment.SanitizeMessage(message, deployment.EnvironmentValues(model))
 }

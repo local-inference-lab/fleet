@@ -851,3 +851,29 @@ func (d *fakeDriver) Inspect(ctx context.Context, model manifest.Model) (deploym
 	state.Exists = true
 	return state, nil
 }
+
+func TestLifecycleErrorsRedactManifestSecrets(t *testing.T) {
+	driver := newFakeDriver()
+	driver.startErr = errors.New("create failed: API_KEY=secret-value-123\x1b[31m\nforged")
+	manager := newTestManager(t, driver)
+	manager.manifest.Models[0].Environment = map[string]string{"API_KEY": "secret-value-123"}
+
+	op, _, err := manager.Activate("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		op, _ = manager.Operation(op.ID)
+		if op.State == "failed" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	status, _ := manager.Status("alpha")
+	for _, message := range []string{op.Error, status.LastError, status.Instances[0].LastError} {
+		if message == "" || strings.Contains(message, "secret-value-123") || strings.ContainsAny(message, "\x1b\n") {
+			t.Fatalf("unsanitized lifecycle error %q (op=%+v status=%+v)", message, op, status)
+		}
+	}
+}

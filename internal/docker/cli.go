@@ -1,6 +1,7 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -97,14 +98,8 @@ func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPU
 		"--label", "ai.local-inference-lab.lil-fleet.fingerprint=" + fingerprint,
 		"--label", gpuLabel + "=" + joinGPUIndices(assignedGPUs),
 	}
-	keys := make([]string, 0, len(model.Environment))
-	for key := range model.Environment {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		args = append(args, "--env", key+"="+model.Environment[key])
-	}
+	envArgs, cliEnv := environmentArgs(model.Environment)
+	args = append(args, envArgs...)
 	for _, mount := range model.Mounts {
 		source := mountSource(model, mount)
 		if mount.PerModel {
@@ -166,13 +161,52 @@ func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPU
 	}
 	args = append(args, model.Image)
 	args = append(args, model.Command...)
-	if _, err := d.output(ctx, args...); err != nil {
+	secrets := deployment.EnvironmentValues(model)
+	if _, err := d.run(ctx, cliEnv, secrets, args...); err != nil {
 		return fmt.Errorf("create container: %w", err)
 	}
-	if _, err := d.output(ctx, "start", name); err != nil {
+	if _, err := d.run(ctx, nil, secrets, "start", name); err != nil {
 		return fmt.Errorf("start container: %w", err)
 	}
 	return nil
+}
+
+// environmentArgs passes environment values to docker create through the CLI
+// process environment ("--env KEY") instead of argv ("--env KEY=VALUE"), so
+// secrets are not visible in the host process table. Keys that would also
+// reconfigure the Docker CLI itself (DOCKER_HOST, proxies, HOME, ...) cannot be
+// routed that way without redirecting the daemon connection, so they stay on
+// argv; they are configuration, not credentials.
+func environmentArgs(environment map[string]string) ([]string, []string) {
+	keys := make([]string, 0, len(environment))
+	for key := range environment {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var args, cliEnv []string
+	for _, key := range keys {
+		if affectsDockerCLI(key) {
+			args = append(args, "--env", key+"="+environment[key])
+			continue
+		}
+		args = append(args, "--env", key)
+		cliEnv = append(cliEnv, key+"="+environment[key])
+	}
+	return args, cliEnv
+}
+
+func affectsDockerCLI(key string) bool {
+	upper := strings.ToUpper(key)
+	for _, prefix := range []string{"DOCKER_", "BUILDX_", "COMPOSE_", "XDG_", "LD_", "GO", "SSL_CERT_"} {
+		if strings.HasPrefix(upper, prefix) {
+			return true
+		}
+	}
+	switch upper {
+	case "HOME", "PATH", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY":
+		return true
+	}
+	return false
 }
 
 func (d *CLIDriver) Stop(ctx context.Context, model manifest.Model, remove bool) error {
@@ -303,16 +337,56 @@ func equalGPUIndices(left, right []int) bool {
 }
 
 func (d *CLIDriver) output(ctx context.Context, args ...string) (string, error) {
+	return d.run(ctx, nil, nil, args...)
+}
+
+// run executes the Docker CLI without a shell. Extra environment entries are
+// appended to Fleet's own environment (later duplicates win). Failures report
+// only sanitized stderr, never argv, with manifest secrets redacted.
+func (d *CLIDriver) run(ctx context.Context, env []string, secrets []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, d.binary, args...)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		message := strings.TrimSpace(string(output))
+	if len(env) != 0 {
+		cmd.Env = append(os.Environ(), env...)
+	}
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &limitedWriter{buffer: &stderr, limit: 64 << 10}
+	if err := cmd.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
 		if message == "" {
 			message = err.Error()
+			if ctx.Err() != nil {
+				message = ctx.Err().Error()
+			}
 		}
-		return "", fmt.Errorf("docker %s: %s", args[0], message)
+		return stdout.String(), &commandError{subcommand: args[0], message: deployment.SanitizeMessage(message, secrets)}
 	}
-	return string(output), nil
+	return stdout.String(), nil
+}
+
+type commandError struct {
+	subcommand string
+	message    string
+}
+
+func (e *commandError) Error() string { return "docker " + e.subcommand + ": " + e.message }
+
+// limitedWriter keeps the first limit bytes so a runaway stderr stream cannot
+// grow Fleet's memory without bound.
+type limitedWriter struct {
+	buffer *bytes.Buffer
+	limit  int
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if remaining := w.limit - w.buffer.Len(); remaining > 0 {
+		if len(p) > remaining {
+			w.buffer.Write(p[:remaining])
+		} else {
+			w.buffer.Write(p)
+		}
+	}
+	return len(p), nil
 }
 
 // hardeningVersion is part of the fingerprint so containers created before a

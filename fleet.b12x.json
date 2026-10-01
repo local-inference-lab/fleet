@@ -62,7 +62,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         },
         {
           "source": "/home/clay/research/lil-fleet/overrides/apply_b12x_preparation_bound.py",
@@ -88,6 +89,7 @@
       "ipc": "private",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "security_opt": [
         "seccomp=overrides/seccomp-deepseek-io-uring.json"
       ],
@@ -142,7 +144,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -153,6 +156,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -217,7 +221,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -228,6 +233,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -418,7 +424,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -429,6 +436,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -469,7 +477,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -480,6 +489,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -520,7 +530,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -531,6 +542,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -569,7 +581,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -580,6 +593,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -672,7 +686,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -684,6 +699,7 @@
       "shm_size": "32g",
       "restart": "unless-stopped",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -781,7 +797,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -793,6 +810,7 @@
       "shm_size": "32g",
       "restart": "unless-stopped",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -836,7 +854,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -847,6 +866,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -924,7 +944,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -935,6 +956,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -977,7 +999,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -988,6 +1011,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -1031,7 +1055,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -1042,6 +1067,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -1172,7 +1198,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         },
         {
           "source": "/home/clay/vllm/llm-inference-bench/mimo-cufile.json",
@@ -1189,6 +1216,7 @@
       "shm_size": "32g",
       "restart": "unless-stopped",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"

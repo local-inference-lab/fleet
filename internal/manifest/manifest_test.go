@@ -798,3 +798,49 @@ func TestLoadRejectsDockerOptionInjection(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadValidatesContainerHardeningOverrides(t *testing.T) {
+	cfg := loadManifest(t, `{"version": 1, "runtime": {}, "models": [{
+		"id": "a", "image": "one", "cap_add": ["DAC_OVERRIDE", "CAP_SYS_NICE"], "user": "1000:1000", "read_only": true,
+		"mounts": [{"source": "/srv/cache", "target": "/cache", "per_model": true}]
+	}]}`)
+	model := cfg.Models[0]
+	if !slices.Equal(model.CapAdd, []string{"DAC_OVERRIDE", "CAP_SYS_NICE"}) || model.User != "1000:1000" || !model.ReadOnly || !model.Mounts[0].PerModel {
+		t.Fatalf("hardening overrides not preserved: %+v", model)
+	}
+	for _, tc := range []struct {
+		name    string
+		model   string
+		wantErr string
+	}{
+		{"all capabilities", `"cap_add": ["ALL"]`, "cap_add entry"},
+		{"lowercase capability", `"cap_add": ["sys_admin"]`, "cap_add entry"},
+		{"user option", `"user": "--privileged"`, "user must be"},
+		{"read-only per-model mount", `"mounts": [{"source": "/srv/cache", "target": "/cache", "read_only": true, "per_model": true}]`, "per_model applies only"},
+		{"environment key with equals", `"environment": {"A=B": "c"}`, "environment key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeManifest(t, `{"version": 1, "runtime": {}, "models": [{"id": "a", "image": "one", `+tc.model+`}]}`))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestB12XWritableCachesArePerModel(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range cfg.Models {
+		for _, mount := range model.Mounts {
+			if mount.Source == "/mnt/llm_stuff/cache" && !mount.PerModel {
+				t.Fatalf("%s shares the writable cache root %s", model.ID, mount.Source)
+			}
+		}
+		if !model.Privileged && !slices.Equal(model.CapAdd, []string{"DAC_OVERRIDE"}) {
+			t.Fatalf("%s cap_add = %v, want only DAC_OVERRIDE for the owner-only cache root", model.ID, model.CapAdd)
+		}
+	}
+}

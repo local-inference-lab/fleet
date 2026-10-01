@@ -171,3 +171,116 @@ func contains(values []string, target string) bool {
 	}
 	return false
 }
+
+func TestHardeningArgsDropPrivilegesUnlessProfileIsPrivileged(t *testing.T) {
+	got := hardeningArgs(manifest.Model{CapAdd: []string{"DAC_OVERRIDE"}, User: "1000:1000", ReadOnly: true})
+	want := []string{
+		"--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE",
+		"--security-opt", "no-new-privileges=true",
+		"--user", "1000:1000", "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev",
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("hardening args = %q, want %q", got, want)
+	}
+	if got := hardeningArgs(manifest.Model{SecurityOpt: []string{"no-new-privileges=false"}}); contains(got, "no-new-privileges=true") {
+		t.Fatalf("explicit no-new-privileges override was replaced: %q", got)
+	}
+	if got := hardeningArgs(manifest.Model{Privileged: true}); len(got) != 0 {
+		t.Fatalf("privileged hardening args = %q, want none", got)
+	}
+}
+
+func TestStartBindsPerModelCacheSubdirectory(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "args.log")
+	scriptPath := writeFakeDocker(t, dir)
+	t.Setenv("FAKE_DOCKER_LOG", logPath)
+	t.Setenv("FAKE_DOCKER_STATE", filepath.Join(dir, "exists"))
+	cache := filepath.Join(dir, "cache")
+	if err := os.Mkdir(cache, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	model := manifest.Model{
+		ID: "alpha--2", Image: "example/image", InstanceProfileID: "alpha", InstanceID: "alpha--2", InstanceIndex: 2,
+		Mounts: []manifest.Mount{{Source: cache, Target: "/cache", PerModel: true}},
+	}
+	if err := NewCLIDriver(scriptPath).Start(context.Background(), model, nil); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	raw, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	want := "type=bind,source=" + filepath.Join(cache, "alpha") + ",target=/cache"
+	if !contains(args, want) || !contains(args, "--cap-drop") || !contains(args, "no-new-privileges=true") {
+		t.Fatalf("Docker args missing per-model mount or hardening:\n%s", raw)
+	}
+	if info, err := os.Stat(filepath.Join(cache, "alpha")); err != nil || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		t.Fatalf("per-model cache directory = %v, %v", info, err)
+	}
+}
+
+func TestFingerprintTracksSeccompContentsAndImageID(t *testing.T) {
+	dir := t.TempDir()
+	profile := filepath.Join(dir, "seccomp.json")
+	if err := os.WriteFile(profile, []byte(`{"defaultAction":"SCMP_ACT_ERRNO"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	imageID := filepath.Join(dir, "image-id")
+	if err := os.WriteFile(imageID, []byte("sha256:one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(dir, "docker")
+	script := "#!/bin/sh\nif [ \"$1\" = image ]; then cat \"$FAKE_IMAGE_ID\"; fi\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("FAKE_IMAGE_ID", imageID)
+	driver := NewCLIDriver(scriptPath)
+	model := manifest.Model{ID: "a", Image: "example/image", SecurityOpt: []string{"seccomp=" + profile}}
+
+	first, err := driver.fingerprint(context.Background(), model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(profile, []byte(`{"defaultAction":"SCMP_ACT_ALLOW"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	second, err := driver.fingerprint(context.Background(), model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(imageID, []byte("sha256:two"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	third, err := driver.fingerprint(context.Background(), model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second || second == third {
+		t.Fatalf("fingerprints did not change: %s %s %s", first, second, third)
+	}
+}
+
+func writeFakeDocker(t *testing.T, dir string) string {
+	t.Helper()
+	scriptPath := filepath.Join(dir, "docker")
+	script := `#!/bin/sh
+if [ "$1" = "inspect" ] && [ ! -f "$FAKE_DOCKER_STATE" ]; then
+  echo "error: no such object" >&2
+  exit 1
+fi
+for arg in "$@"; do
+  printf '%s\n' "$arg" >> "$FAKE_DOCKER_LOG"
+done
+if [ "$1" = "create" ]; then
+  : > "$FAKE_DOCKER_STATE"
+fi
+`
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write fake docker: %v", err)
+	}
+	return scriptPath
+}

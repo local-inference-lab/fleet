@@ -56,9 +56,10 @@ type Status struct {
 }
 
 type InstanceStatus struct {
-	InstanceID   string    `json:"instance_id"`
-	Index        int       `json:"index"`
-	Port         int       `json:"port,omitempty"`
+	InstanceID string `json:"instance_id"`
+	Index      int    `json:"index"`
+	// Port is always present: API clients (llmconduit) treat it as required.
+	Port         int       `json:"port"`
 	Phase        Phase     `json:"phase"`
 	Container    string    `json:"container_status,omitempty"`
 	Health       string    `json:"health,omitempty"`

@@ -22,7 +22,7 @@ go run ./cmd/lil-fleet -manifest fleet.json -token-file .secrets/api-token
 curl -H "Authorization: Bearer $(cat .secrets/api-token)" http://127.0.0.1:8090/v1/models
 ```
 
-`/healthz` and `/readyz` remain unauthenticated for local probes. All `/v1/*` routes require the token when `-token-file` is supplied.
+`/healthz` and `/readyz` remain unauthenticated for local probes. All `/v1/*` routes require the token when `-token-file` is supplied. Fleet refuses to start without `-token-file` when `api.listen` is not a loopback address; pass `-insecure-no-auth` only if something else authenticates every request. Keep the token file mode `0600`; Fleet warns at startup when it is readable by group or others. The HTTP server bounds header, body, response, and idle time (5s/30s/60s/120s); every route answers from memory, so no request is long-lived.
 
 The example model images are illustrative floating tags. For a reproducible deployment, replace them with image digests, pin model revisions in each command, and use host paths that exist on the Docker daemon host.
 

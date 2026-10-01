@@ -117,7 +117,13 @@ Unload a model:
 curl -i -X POST http://127.0.0.1:8090/v1/models/mistral-7b/unload
 ```
 
-Unload stops all instances of that profile. Lifecycle calls are idempotent. A duplicate in-flight call returns the same operation; a conflicting call returns `409 Conflict`. The controller permits only one lifecycle operation at a time so two GPU-heavy profiles cannot race into memory.
+Unload stops all instances of that profile. Lifecycle calls are idempotent per model: a duplicate in-flight call (same kind and, for loads, the same `instances`) returns the same operation, and a conflicting call for that model returns `409 Conflict`. Without `runtime.concurrent_deployments`, switching is exclusive, so any lifecycle call during a running operation returns `409`. With it, each model has its own operation: a model waiting up to `readiness_timeout` for readiness does not block loads or unloads of other models. Container stop/create/start steps are still serialized fleet-wide by a short lock, so two GPU-heavy profiles never start at the same instant, and GPUs are reserved under the manager lock before any container is created.
+
+Note that an empty load body and `{"instances":1}` differ when a model already runs replicas: the empty body keeps the current replica count, while `{"instances":1}` scales down to one.
+
+Loading is observed every second (or `runtime.poll_interval` if shorter), so a model is reported ready within about a second of its probe passing. An exclusive switch stops only models that actually have containers, and stops them in parallel. Each stop is bounded by `runtime.stop_timeout` (default `operation_timeout`, never less than the model's own `stop_timeout` plus 15s). A missing image is pulled before create under `runtime.pull_timeout` (default `30m`), outside the lifecycle lock. Every Docker and `nvidia-smi` call has a deadline; the GPU snapshot runs outside the manager lock with a 5s limit.
+
+Finished operations are kept for one hour, and at most 256 are retained; older ones return `404` from `/v1/operations/{id}`. Running operations are never evicted.
 
 ## Patched B12X fleet
 
@@ -211,7 +217,7 @@ Full schemas are in [`openapi.yaml`](openapi.yaml).
 `fleet.json` is the administrative interface. The API never writes it. Fleet checks the file once per second and atomically applies each valid change while retaining the last valid configuration if a write is incomplete or invalid. Model additions and changes to unloaded models are live; removing or changing an active model is retried after that model is unloaded. Changes to `api.listen` or `runtime.docker_binary` still require a controller restart. The file supports:
 
 - controller listen address and Docker binary;
-- reconciliation, command, and readiness timeouts;
+- reconciliation, command, readiness, stop (`stop_timeout`), and image pull (`pull_timeout`) timeouts;
 - an optional inclusive `runtime.model_port_range` that requires every model command,
   published host port, and loopback HTTP readiness probe to use the same port inside
   that range;
@@ -269,19 +275,19 @@ Environment and commands are deliberately omitted from API responses so secrets 
 
 ## Deployment states
 
-- `unloaded`: no container exists, or it is cleanly stopped;
+- `unloaded`: no container exists, or it is cleanly stopped (including exit 137/143 after a requested stop);
 - `loading`: the container exists but its readiness probe has not succeeded;
 - `ready`: Docker is running and the manifest probe succeeded;
 - `unhealthy`: Docker or the application probe reports unhealthy;
 - `stopping`: an unload is running;
-- `failed`: start, stop, exit, timeout, or OOM failure;
+- `failed`: start, stop, unexpected exit, timeout, or OOM failure;
 - `unknown`: Docker could not be inspected.
 
-The controller reconciles Docker state on startup and at `runtime.poll_interval`; status is not based only on API intent. Deployment status includes aggregate compatibility fields plus `desired_instances`, `ready_instances`, and per-instance `instances[]` with the concrete instance ID, index, port, phase, GPU assignment, and health. Managed containers are named `lil-fleet-{model-id}` for the first instance and `lil-fleet-{model-id}--N` for replicas, and each is labeled with the profile model and a manifest fingerprint. A changed manifest causes a stale stopped or running container to be replaced on its next load.
+The controller reconciles Docker state on startup and at `runtime.poll_interval` with one `docker ps` plus one `docker container inspect` for all managed containers, then probes readiness in parallel (2s per probe). Status is not based only on API intent. An observation made while a lifecycle operation changed the model, or while an operation owns it, is discarded instead of overwriting newer state. Deployment status includes aggregate compatibility fields plus `desired_instances`, `ready_instances`, and per-instance `instances[]` with the concrete instance ID, index, port, phase, GPU assignment, and health. Managed containers are named `lil-fleet-{model-id}` for the first instance and `lil-fleet-{model-id}--N` for replicas, and each is labeled with the profile model and a manifest fingerprint. A changed manifest causes a stale stopped or running container to be replaced on its next load.
 
 ## Security notes
 
-Docker daemon access is effectively host administration. Keep this API on loopback or a protected administrative network. Add authentication at a reverse proxy before exposing it to other users. The current API is a control plane only; inference traffic goes directly to each manifest-defined published port.
+Docker daemon access is effectively host administration. Keep this API on loopback or a protected administrative network, always with `-token-file` when it is reachable by anyone else. The current API is a control plane only; inference traffic goes directly to each manifest-defined port, which must stay on loopback (host networking) or a loopback-published port. Model environment values reach `docker create` through the CLI's environment rather than argv (except keys the Docker CLI itself reads, such as `DOCKER_*`, `HOME`, `PATH`, and proxy variables). Docker and runtime error text is stripped of control characters, capped at 1 KiB, and redacted of manifest environment values before it appears in operations, status, or logs.
 
 Run all checks with:
 

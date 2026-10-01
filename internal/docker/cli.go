@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,7 +70,7 @@ func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPU
 	if err != nil && !errors.Is(err, deployment.ErrNotFound) {
 		return err
 	}
-	fingerprint, err := modelFingerprint(model)
+	fingerprint, err := d.fingerprint(ctx, model)
 	if err != nil {
 		return err
 	}
@@ -103,7 +106,11 @@ func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPU
 		args = append(args, "--env", key+"="+model.Environment[key])
 	}
 	for _, mount := range model.Mounts {
-		value := "type=bind,source=" + mount.Source + ",target=" + mount.Target
+		source := mountSource(model, mount)
+		if mount.PerModel {
+			ensurePerModelDirectory(source)
+		}
+		value := "type=bind,source=" + source + ",target=" + mount.Target
 		if mount.ReadOnly {
 			value += ",readonly"
 		}
@@ -138,6 +145,7 @@ func (d *CLIDriver) Start(ctx context.Context, model manifest.Model, assignedGPU
 	if model.Entrypoint != "" {
 		args = append(args, "--entrypoint", model.Entrypoint)
 	}
+	args = append(args, hardeningArgs(model)...)
 	for _, value := range model.SecurityOpt {
 		args = append(args, "--security-opt", value)
 	}
@@ -307,8 +315,97 @@ func (d *CLIDriver) output(ctx context.Context, args ...string) (string, error) 
 	return string(output), nil
 }
 
-func modelFingerprint(model manifest.Model) (string, error) {
-	encoded, err := json.Marshal(model)
+// hardeningVersion is part of the fingerprint so containers created before a
+// change to the default hardening are recreated on their next start.
+const hardeningVersion = "2"
+
+// hardeningArgs applies least-privilege defaults. Privileged profiles opt out
+// explicitly; everything else drops every capability (add back individual ones
+// with cap_add) and cannot gain privileges through setuid binaries. Neither
+// default affects GPU access, which the NVIDIA runtime hook sets up outside the
+// container's capability set.
+func hardeningArgs(model manifest.Model) []string {
+	var args []string
+	if !model.Privileged {
+		args = append(args, "--cap-drop", "ALL")
+		for _, capability := range model.CapAdd {
+			args = append(args, "--cap-add", capability)
+		}
+		if !hasSecurityOpt(model.SecurityOpt, "no-new-privileges") {
+			args = append(args, "--security-opt", "no-new-privileges=true")
+		}
+	}
+	if model.User != "" {
+		args = append(args, "--user", model.User)
+	}
+	if model.ReadOnly {
+		args = append(args, "--read-only", "--tmpfs", "/tmp:rw,nosuid,nodev")
+	}
+	return args
+}
+
+func hasSecurityOpt(options []string, name string) bool {
+	for _, option := range options {
+		if option == name || strings.HasPrefix(option, name+"=") || strings.HasPrefix(option, name+":") {
+			return true
+		}
+	}
+	return false
+}
+
+// mountSource returns the host path for a bind mount. Per-model mounts get a
+// subdirectory named after the profile (replicas share their profile's
+// directory) so writable caches cannot be read or poisoned across profiles.
+// The container target is unchanged, so paths such as VLLM_CACHE_ROOT=/cache/x
+// keep working.
+func mountSource(model manifest.Model, mount manifest.Mount) string {
+	if !mount.PerModel {
+		return mount.Source
+	}
+	return path.Join(mount.Source, profileID(model))
+}
+
+// ensurePerModelDirectory creates a per-model cache directory when the parent
+// is visible to Fleet. When Fleet runs in a container without that host path,
+// creation is skipped and Docker reports the missing bind source instead.
+func ensurePerModelDirectory(dir string) {
+	if info, err := os.Stat(filepath.Dir(dir)); err != nil || !info.IsDir() {
+		return
+	}
+	_ = os.Mkdir(dir, 0o700)
+}
+
+type fingerprintInput struct {
+	Model            manifest.Model    `json:"model"`
+	HardeningVersion string            `json:"hardening_version"`
+	ImageID          string            `json:"image_id,omitempty"`
+	SeccompProfiles  map[string]string `json:"seccomp_profiles,omitempty"`
+}
+
+// fingerprint identifies everything that shapes a container: the manifest
+// profile, the hardening defaults, the contents of referenced seccomp profiles,
+// and (best effort) the local image ID so a retagged image is picked up.
+func (d *CLIDriver) fingerprint(ctx context.Context, model manifest.Model) (string, error) {
+	input := fingerprintInput{Model: model, HardeningVersion: hardeningVersion}
+	for _, option := range model.SecurityOpt {
+		profile, ok := manifest.SeccompProfilePath(option)
+		if !ok {
+			continue
+		}
+		contents, err := os.ReadFile(profile)
+		if err != nil {
+			return "", fmt.Errorf("read seccomp profile: %w", err)
+		}
+		sum := sha256.Sum256(contents)
+		if input.SeccompProfiles == nil {
+			input.SeccompProfiles = map[string]string{}
+		}
+		input.SeccompProfiles[profile] = hex.EncodeToString(sum[:])
+	}
+	if id, err := d.output(ctx, "image", "inspect", "--format", "{{.Id}}", model.Image); err == nil {
+		input.ImageID = strings.TrimSpace(id)
+	}
+	encoded, err := json.Marshal(input)
 	if err != nil {
 		return "", fmt.Errorf("fingerprint model: %w", err)
 	}

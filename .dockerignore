@@ -12,3 +12,9 @@ fleet.*.local.json
 *.pem
 *.key
 *.log
+lil-fleet
+lil-fleet.*
+*.before-*
+**/__pycache__
+Dockerfile.slopllm-*
+overrides/slopllm-*

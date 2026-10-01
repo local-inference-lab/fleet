@@ -13,3 +13,9 @@
 *.pem
 *.key
 *.log
+/lil-fleet.*
+*.before-*
+__pycache__/
+*.pyc
+Dockerfile.slopllm-*
+overrides/slopllm-*

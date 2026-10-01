@@ -49,7 +49,12 @@ paths:
       - $ref: "#/components/parameters/ModelId"
     post:
       operationId: loadModel
-      description: Empty body preserves the legacy load behavior. A JSON body with instances requests an exact target replica count; Fleet reserves disjoint manifest-approved GPUs and ports before creating new containers.
+      description: >-
+        Empty body preserves the legacy load behavior (ensure at least one instance, keeping a
+        larger current replica count). A JSON body with instances requests an exact target replica
+        count, so {"instances":1} scales a replicated model down to one. Fleet reserves disjoint
+        manifest-approved GPUs and ports before creating new containers. A request above
+        max_instances returns 409 insufficient_resources.
       requestBody:
         required: false
         content:
@@ -58,7 +63,7 @@ paths:
       responses:
         "200": {description: Model was already ready}
         "202": {$ref: "#/components/responses/OperationAccepted"}
-        "400": {description: Invalid body or instance count, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+        "400": {description: Invalid body or instance count (code invalid_request), content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
         "404": {$ref: "#/components/responses/NotFound"}
         "409": {$ref: "#/components/responses/Conflict"}
   /v1/models/{modelId}/unload:
@@ -125,7 +130,7 @@ paths:
       operationId: getOperation
       responses:
         "200": {description: Lifecycle operation, content: {application/json: {schema: {$ref: "#/components/schemas/Operation"}}}}
-        "404": {$ref: "#/components/responses/NotFound"}
+        "404": {description: Unknown operation, or a finished one evicted after one hour or beyond the newest 256, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
 components:
   securitySchemes:
     bearerAuth:
@@ -156,7 +161,10 @@ components:
       description: Model or operation not found
       content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
     Conflict:
-      description: A conflicting lifecycle operation is active or insufficient topology-compatible GPUs are free
+      description: >-
+        A conflicting lifecycle operation is active (code operation_in_progress: another operation
+        for this model, or any operation when concurrent_deployments is off), or insufficient
+        topology-compatible GPUs/ports are free (code insufficient_resources).
       content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
   schemas:
     Model:
@@ -210,15 +218,15 @@ components:
         assigned_gpus:
           type: array
           items: {type: integer, minimum: 0}
-        last_error: {type: string}
+        last_error: {type: string, maxLength: 1024, description: Sanitized and redacted diagnostic text.}
         last_checked: {type: string, format: date-time}
     InstanceStatus:
       type: object
-      required: [instance_id, index, phase, last_checked]
+      required: [instance_id, index, port, phase, last_checked]
       properties:
         instance_id: {type: string}
         index: {type: integer, minimum: 1}
-        port: {type: integer, minimum: 1, maximum: 65535}
+        port: {type: integer, minimum: 0, maximum: 65535, description: Listener port; 0 when the profile declares none.}
         phase: {type: string, enum: [unloaded, loading, ready, unhealthy, stopping, failed, unknown]}
         container_status: {type: string}
         health: {type: string}
@@ -227,7 +235,7 @@ components:
         assigned_gpus:
           type: array
           items: {type: integer, minimum: 0}
-        last_error: {type: string}
+        last_error: {type: string, maxLength: 1024, description: Sanitized and redacted diagnostic text.}
         last_checked: {type: string, format: date-time}
     Operation:
       type: object
@@ -241,7 +249,7 @@ components:
           minimum: 0
           description: Target instance count for this lifecycle operation; unload uses zero.
         state: {type: string, enum: [pending, running, succeeded, failed]}
-        error: {type: string}
+        error: {type: string, maxLength: 1024, description: Sanitized and redacted failure text.}
         created_at: {type: string, format: date-time}
         started_at: {type: string, format: date-time}
         finished_at: {type: string, format: date-time}

@@ -844,3 +844,25 @@ func TestB12XWritableCachesArePerModel(t *testing.T) {
 		}
 	}
 }
+
+func TestRuntimeStopAndPullTimeouts(t *testing.T) {
+	cfg := loadManifest(t, `{"version": 1, "runtime": {"operation_timeout": "30s"}, "models": [
+		{"id": "a", "image": "one"}, {"id": "b", "image": "one", "stop_timeout": "2m"}
+	]}`)
+	a, _ := cfg.Model("a")
+	b, _ := cfg.Model("b")
+	if cfg.Runtime.StopDuration(a) != 30*time.Second || cfg.Runtime.PullDuration() != 30*time.Minute {
+		t.Fatalf("default stop/pull = %s/%s", cfg.Runtime.StopDuration(a), cfg.Runtime.PullDuration())
+	}
+	// A Docker stop timeout longer than Fleet's deadline would be cut short.
+	if got := cfg.Runtime.StopDuration(b); got != 2*time.Minute+15*time.Second {
+		t.Fatalf("stop deadline for 2m container stop timeout = %s", got)
+	}
+	cfg = loadManifest(t, `{"version": 1, "runtime": {"stop_timeout": "5m", "pull_timeout": "2h"}, "models": [{"id": "a", "image": "one"}]}`)
+	if cfg.Runtime.StopDuration(cfg.Models[0]) != 5*time.Minute || cfg.Runtime.PullDuration() != 2*time.Hour {
+		t.Fatalf("configured stop/pull = %s/%s", cfg.Runtime.StopDuration(cfg.Models[0]), cfg.Runtime.PullDuration())
+	}
+	if _, err := Load(writeManifest(t, `{"version": 1, "runtime": {"stop_timeout": "0s"}, "models": [{"id": "a", "image": "one"}]}`)); err == nil {
+		t.Fatal("zero stop_timeout accepted")
+	}
+}

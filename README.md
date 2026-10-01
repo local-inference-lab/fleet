@@ -129,11 +129,15 @@ The upstream policy is Copyright The Moby Authors, under the
 modification notice. A regression test checks the rest of the policy against
 the pinned upstream JSON checksum.
 
-Run Fleet from the repository root (including the service's `WorkingDirectory`)
-so Docker's CLI can read that relative profile path. For another working
-directory, use an absolute `seccomp=` path available to the Docker CLI. Manifest
-changes require a controller restart and a model unload/load to recreate the
-container; restarting the controller alone does not update running containers.
+Fleet resolves a relative `seccomp=` path against the manifest's directory when
+it loads the manifest, and rejects the manifest if the file is missing, so the
+profile no longer depends on the controller's working directory. The Docker CLI
+reads the profile client-side, so when Fleet runs in a container the profile must
+be mounted at the same path as the manifest's `overrides/` directory (see
+[Running the controller in Docker](#running-the-controller-in-docker)). Fleet
+fingerprints the profile's contents, so editing it recreates the container on
+the next load. Running containers are not updated until they are unloaded and
+loaded again.
 Rebase the custom profile when upgrading Docker so it receives future default
 policy improvements.
 

@@ -102,7 +102,7 @@ The same wrapper applies an opt-in [vLLM sequence-info patch](overrides/apply_vl
 
 DeepSeek uses disk-backed Engram tables. Qwen Flash Next TP2/TP3 use disk-backed PLE tables; TP4 disables PLE CPU offload so its tables remain on GPU. GLM 5.3 TP6 and Qwen Flash Next TP3 are labeled experimental because upstream has not published qualified recipes for those shapes.
 
-The `swift15-flash-next-nvfp4-tp4` profile serves [UkisAI Swift 1.5 Flash Next NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) as `Swift-1.5-Flash-Next-NVFP4` on port `8112`. It reuses the Qwen Flash Next TP4 runtime with PLE tables in VRAM and allocates one four-GPU PCIe group. Place the checkpoint in `/mnt/llm_stuff/models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4` before loading it. Allow port `8112` in host/container firewall rules where remote access is needed.
+The `swift15-flash-next-nvfp4-tp4` profile serves [UkisAI Swift 1.5 Flash Next NVFP4](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-NVFP4) as `Swift-1.5-Flash-Next-NVFP4` on port `8112`. It reuses the Qwen Flash Next TP4 runtime with PLE tables in VRAM and allocates one four-GPU PCIe group. Place the checkpoint in `/mnt/llm_stuff/models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4` before loading it. Like every host-networked B12X profile, it listens only on `127.0.0.1`; reach it through a local proxy or the llmconduit worker on this host.
 
 The `mimo-v26-flash-mopd-tp4` profile serves [MiMo-V2.6-Flash-MOPD](https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-MOPD) on port `8113` from `/mnt/llm_stuff/models/MiMo-V2.6-Flash-MOPD`. It uses four GPUs, the Karmic Kraken MiMo runtime, FP8 KV cache, and the bundled TP4 DFlash draft. Its fast bounce loader uses the existing Docker-default-based seccomp profile that adds only the three `io_uring` syscalls.
 
@@ -181,6 +181,8 @@ with it to pass Docker `--memory-swap`. Use equal values such as
 be killed inside its own container instead of growing into host swap. Docker's
 `-1` swap value is accepted for unlimited swap, but `memory_swap_limit` cannot be
 set without `memory_limit`, and finite swap must be at least the memory limit.
+
+Profiles with `network_mode: "host"` skip Docker port publishing, so whatever address the server binds is reachable from every network the host joins, without authentication. Fleet therefore rejects a host-networked profile unless it binds loopback explicitly: every `--host`/`--host=` argument and any `HOST` environment value must be `127.0.0.0/8`, `::1`, or `localhost`, and at least one of them must be present, because vLLM, lil-serve, and the GLM serve scripts all default to `0.0.0.0`. The B12X profiles pass `--host 127.0.0.1` (or `HOST=127.0.0.1` for `glm53-tp8`, whose entrypoint reads `HOST`). Local consumers such as the llmconduit worker, including a rootless container that reaches host loopback through `slirp4netns:allow_host_loopback`, are unaffected. Bridge-networked profiles such as those in `fleet.example.json` keep `--host 0.0.0.0` inside the container and publish only to `127.0.0.1` by default.
 
 Profiles that Fleet can co-schedule must use distinct base ports. Mutually exclusive profiles may share a port; TP8 Pro shares `8109` with TP4 Flash because it requires all GPUs. Replicas use the same inclusive `runtime.model_port_range` as a dynamic port pool, and the B12X manifest restricts model listeners to `8101` through `8121`; keep the surrounding host and container firewall rules synchronized with that range.
 

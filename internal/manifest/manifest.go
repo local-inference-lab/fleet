@@ -273,6 +273,11 @@ func (m *Manifest) validate() error {
 				return fmt.Errorf("model %q port %d: host port %d is outside runtime.model_port_range", model.ID, j, port.HostPort)
 			}
 		}
+		if model.NetworkMode == "host" {
+			if err := validateHostNetworkBind(*model); err != nil {
+				return fmt.Errorf("model %q: %w", model.ID, err)
+			}
+		}
 		if model.Readiness != nil {
 			if model.Readiness.URL == "" {
 				return fmt.Errorf("model %q: readiness.url is required", model.ID)
@@ -395,6 +400,53 @@ func commandPort(command []string) (int, error) {
 		return 0, errors.New("command must contain exactly one --port when runtime.model_port_range is configured")
 	}
 	return port, nil
+}
+
+// validateHostNetworkBind keeps host-networked inference servers off public
+// interfaces. Host networking has no publish step, so a server bound to 0.0.0.0
+// or :: is reachable, unauthenticated, from every network the host joins. vLLM,
+// lil-serve, and the GLM serve scripts all default to 0.0.0.0, so an absent bind
+// is treated as public too.
+func validateHostNetworkBind(model Model) error {
+	explicit := false
+	for index := 0; index < len(model.Command); index++ {
+		value := ""
+		switch argument := model.Command[index]; {
+		case argument == "--host":
+			if index+1 >= len(model.Command) {
+				return errors.New("--host requires a value")
+			}
+			index++
+			value = model.Command[index]
+		case strings.HasPrefix(argument, "--host="):
+			value = strings.TrimPrefix(argument, "--host=")
+		default:
+			continue
+		}
+		explicit = true
+		if !isLoopbackHost(value) {
+			return fmt.Errorf("network_mode \"host\" would expose --host %q on every host interface; bind to 127.0.0.1 or ::1", value)
+		}
+	}
+	if value, ok := model.Environment["HOST"]; ok {
+		explicit = true
+		if !isLoopbackHost(value) {
+			return fmt.Errorf("network_mode \"host\" would expose HOST=%q on every host interface; bind to 127.0.0.1 or ::1", value)
+		}
+	}
+	if !explicit {
+		return errors.New("network_mode \"host\" requires an explicit loopback bind (--host 127.0.0.1 or environment HOST=127.0.0.1) because model servers default to all interfaces")
+	}
+	return nil
+}
+
+func isLoopbackHost(value string) bool {
+	host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(value), "["), "]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func validateReadinessURL(modelID, raw string, servePort int, portRange PortRange) error {

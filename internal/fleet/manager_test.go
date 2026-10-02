@@ -39,7 +39,9 @@ func TestActivateUnloadsOtherModelsBeforeStartingTarget(t *testing.T) {
 	driver.mu.Lock()
 	calls := append([]string(nil), driver.calls...)
 	driver.mu.Unlock()
-	want := []string{"inspect:alpha", "inspect:beta", "stop:alpha:true", "start:beta", "inspect:beta"}
+	// One container listing per reconcile, only models that have containers
+	// are stopped, and readiness is observed with a single listing.
+	want := []string{"list", "stop:alpha:true", "start:beta", "list"}
 	if !reflect.DeepEqual(calls, want) {
 		t.Fatalf("driver calls = %#v, want %#v", calls, want)
 	}
@@ -236,7 +238,7 @@ func TestRefreshAdoptsRunningContainersAfterRestart(t *testing.T) {
 				t.Fatalf("missing container status = %+v", missing)
 			}
 			for _, call := range driver.calls {
-				if !strings.HasPrefix(call, "inspect:") {
+				if call != "list" && !strings.HasPrefix(call, "inspect:") {
 					t.Fatalf("discovery mutated a container: %s", call)
 				}
 			}
@@ -829,6 +831,33 @@ func (d *fakeDriver) Stop(ctx context.Context, model manifest.Model, remove bool
 	return nil
 }
 
+func (d *fakeDriver) List(ctx context.Context) ([]deployment.ContainerState, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = append(d.calls, "list")
+	if d.inspectErr != nil {
+		return nil, d.inspectErr
+	}
+	return fakeList(d.states), nil
+}
+
+// fakeList derives Fleet's identity labels from the fake's instance-ID keys.
+func fakeList(states map[string]deployment.ContainerState) []deployment.ContainerState {
+	var result []deployment.ContainerState
+	for id, state := range states {
+		state.Exists = true
+		state.InstanceID = id
+		state.ModelID, state.InstanceIndex = id, 1
+		if base, suffix, ok := strings.Cut(id, "--"); ok {
+			if index, err := strconv.Atoi(suffix); err == nil {
+				state.ModelID, state.InstanceIndex = base, index
+			}
+		}
+		result = append(result, state)
+	}
+	return result
+}
+
 type fakeGPUProvider struct {
 	devices []gpu.Device
 }
@@ -851,3 +880,33 @@ func (d *fakeDriver) Inspect(ctx context.Context, model manifest.Model) (deploym
 	state.Exists = true
 	return state, nil
 }
+
+func TestLifecycleErrorsRedactManifestSecrets(t *testing.T) {
+	driver := newFakeDriver()
+	driver.startErr = errors.New("create failed: API_KEY=secret-value-123\x1b[31m\nforged")
+	manager := newTestManager(t, driver)
+	manager.manifest.Models[0].Environment = map[string]string{"API_KEY": "secret-value-123"}
+
+	op, _, err := manager.Activate("alpha")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		op, _ = manager.Operation(op.ID)
+		if op.State == "failed" || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	status, _ := manager.Status("alpha")
+	for _, message := range []string{op.Error, status.LastError, status.Instances[0].LastError} {
+		if message == "" || strings.Contains(message, "secret-value-123") || strings.ContainsAny(message, "\x1b\n") {
+			t.Fatalf("unsanitized lifecycle error %q (op=%+v status=%+v)", message, op, status)
+		}
+	}
+}
+
+func newDiscardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+func writeFile(path, body string) error { return os.WriteFile(path, []byte(body), 0o600) }

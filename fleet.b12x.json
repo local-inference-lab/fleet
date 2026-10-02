@@ -47,6 +47,8 @@
         "/models/deepseek-v4.1-flash",
         "--tensor-parallel-size",
         "4",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8101",
         "--engram-config",
@@ -60,7 +62,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         },
         {
           "source": "/home/clay/research/lil-fleet/overrides/apply_b12x_preparation_bound.py",
@@ -86,6 +89,7 @@
       "ipc": "private",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "security_opt": [
         "seccomp=overrides/seccomp-deepseek-io-uring.json"
       ],
@@ -127,6 +131,8 @@
         "mtp",
         "--draft-tokens",
         "3",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8102"
       ],
@@ -138,7 +144,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -149,6 +156,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -196,7 +204,7 @@
         "--max-num-batched-tokens",
         "2048",
         "--host",
-        "0.0.0.0",
+        "127.0.0.1",
         "--port",
         "8103"
       ],
@@ -213,7 +221,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -224,6 +233,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -284,6 +294,7 @@
         "NCCL_PROTO": "LL,LL128,Simple",
         "NUM_SPECULATIVE_TOKENS": "3",
         "OMP_NUM_THREADS": "1",
+        "HOST": "127.0.0.1",
         "PORT": "8104",
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHON_BIN": "/opt/venv/bin/python",
@@ -398,7 +409,7 @@
         "--max-num-batched-tokens",
         "4096",
         "--host",
-        "0.0.0.0",
+        "127.0.0.1",
         "--port",
         "8105"
       ],
@@ -413,7 +424,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -424,6 +436,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -451,6 +464,8 @@
         "/models/Qwen3.8-Flash-Next-NVFP4",
         "--tensor-parallel-size",
         "2",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8106"
       ],
@@ -462,7 +477,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -473,6 +489,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -500,6 +517,8 @@
         "/models/Qwen3.8-Flash-Next-NVFP4",
         "--tensor-parallel-size",
         "3",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8107"
       ],
@@ -511,7 +530,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -522,6 +542,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -547,6 +568,8 @@
         "/models/Qwen3.8-Flash-Next-NVFP4",
         "--tensor-parallel-size",
         "4",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8108"
       ],
@@ -558,7 +581,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -569,6 +593,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -588,7 +613,7 @@
         "--served-model-name",
         "MiMo-V2.6-Flash-RL",
         "--host",
-        "0.0.0.0",
+        "127.0.0.1",
         "--port",
         "8109",
         "--tensor-parallel-size",
@@ -661,7 +686,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -673,6 +699,7 @@
       "shm_size": "32g",
       "restart": "unless-stopped",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -695,7 +722,7 @@
         "--served-model-name",
         "MiMo-V2.6-Pro-RL",
         "--host",
-        "0.0.0.0",
+        "127.0.0.1",
         "--port",
         "8109",
         "--tensor-parallel-size",
@@ -770,7 +797,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -782,6 +810,7 @@
       "shm_size": "32g",
       "restart": "unless-stopped",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -812,6 +841,8 @@
         "4",
         "--served-model-name",
         "Qwen3.8-Flash-Next-QAD-4000",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8110"
       ],
@@ -823,7 +854,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -834,6 +866,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -884,7 +917,7 @@
         "--max-num-batched-tokens",
         "4096",
         "--host",
-        "0.0.0.0",
+        "127.0.0.1",
         "--port",
         "8114",
         "--compilation-config",
@@ -911,7 +944,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -922,6 +956,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -951,6 +986,8 @@
         "3",
         "--served-model-name",
         "GLM-5.3-Flash-NVFP4-QAD-TVN-3500",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8111"
       ],
@@ -962,7 +999,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -973,6 +1011,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -1003,6 +1042,8 @@
         "4",
         "--served-model-name",
         "Swift-1.5-Flash-Next-NVFP4",
+        "--host",
+        "127.0.0.1",
         "--port",
         "8112"
       ],
@@ -1014,7 +1055,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         }
       ],
       "placement": {
@@ -1025,6 +1067,7 @@
       "ipc": "host",
       "shm_size": "32g",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"
@@ -1047,7 +1090,7 @@
         "--served-model-name",
         "MiMo-V2.6-Flash-MOPD",
         "--host",
-        "0.0.0.0",
+        "127.0.0.1",
         "--port",
         "8113",
         "--tensor-parallel-size",
@@ -1155,7 +1198,8 @@
         },
         {
           "source": "/mnt/llm_stuff/cache",
-          "target": "/cache"
+          "target": "/cache",
+          "per_model": true
         },
         {
           "source": "/home/clay/vllm/llm-inference-bench/mimo-cufile.json",
@@ -1172,6 +1216,7 @@
       "shm_size": "32g",
       "restart": "unless-stopped",
       "init": true,
+      "cap_add": ["DAC_OVERRIDE"],
       "ulimits": [
         "memlock=-1:-1",
         "stack=67108864:67108864"

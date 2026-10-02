@@ -295,8 +295,18 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(fleet.b12x.json) error = %v", err)
 	}
-	if len(cfg.Models) != 15 {
-		t.Fatalf("model count = %d, want 15", len(cfg.Models))
+	if len(cfg.Models) != 16 {
+		t.Fatalf("model count = %d, want 16", len(cfg.Models))
+	}
+	if qad, ok := cfg.Model("qwen38-flash-next-qad5500-tp4"); !ok {
+		t.Fatal("qwen38-flash-next-qad5500-tp4 missing")
+	} else {
+		args := strings.Join(qad.Command, " ")
+		for _, want := range []string{"--model /models/Qwen3.8-Flash-Next-NVFP4-QAD-5500", "--served-model-name Qwen3.8-Flash-Next-QAD-5500", "--port 8115", "--no-language-model-only"} {
+			if !strings.Contains(args, want) {
+				t.Fatalf("qad5500 command %q lacks %q", args, want)
+			}
+		}
 	}
 	if !cfg.Runtime.ConcurrentDeployments {
 		t.Fatal("B12X manifest must enable concurrent deployments")

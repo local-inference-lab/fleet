@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/local-inference-lab/fleet/internal/deployment"
 	"github.com/local-inference-lab/fleet/internal/fleet"
@@ -257,4 +259,96 @@ func (d *apiDriver) Inspect(_ context.Context, model manifest.Model) (deployment
 	}
 	state.Exists = true
 	return state, nil
+}
+
+func (d *apiDriver) List(context.Context) ([]deployment.ContainerState, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var result []deployment.ContainerState
+	for id, state := range d.states {
+		state.Exists, state.ModelID, state.InstanceID, state.InstanceIndex = true, id, id, 1
+		result = append(result, state)
+	}
+	return result, nil
+}
+
+// TestHandlerMatchesLLMConduitFleetContract pins the fields llmconduit's
+// dashboard and mesh worker deserialize as required.
+func TestHandlerMatchesLLMConduitFleetContract(t *testing.T) {
+	handler := newTestHandler(t)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/v1/models/alpha/load", bytes.NewBufferString(`{"instances":1}`)))
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("load status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var lifecycle map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &lifecycle); err != nil {
+		t.Fatal(err)
+	}
+	operation, _ := lifecycle["operation"].(map[string]any)
+	for _, field := range []string{"id", "kind", "model_id", "state", "created_at"} {
+		if _, ok := operation[field]; !ok || lifecycle["changed"] != true {
+			t.Fatalf("lifecycle response missing %q: %s", field, recorder.Body.String())
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		recorder = httptest.NewRecorder()
+		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+		var payload struct {
+			Models []struct {
+				Model  map[string]any `json:"model"`
+				Status map[string]any `json:"status"`
+			} `json:"models"`
+		}
+		if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+			t.Fatal(err)
+		}
+		model, status := payload.Models[0].Model, payload.Models[0].Status
+		instances, _ := status["instances"].([]any)
+		if len(instances) == 1 && status["phase"] == "ready" {
+			for _, field := range []string{"id", "image", "max_instances"} {
+				if _, ok := model[field]; !ok {
+					t.Fatalf("model missing %q: %v", field, model)
+				}
+			}
+			for _, field := range []string{"model_id", "phase", "desired_state"} {
+				if _, ok := status[field]; !ok {
+					t.Fatalf("status missing %q: %v", field, status)
+				}
+			}
+			instance := instances[0].(map[string]any)
+			// The test profile has no port; llmconduit still requires the key.
+			for _, field := range []string{"instance_id", "index", "port", "phase"} {
+				if _, ok := instance[field]; !ok {
+					t.Fatalf("instance missing %q: %v", field, instance)
+				}
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("model never became ready: %s", recorder.Body.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestLifecycleErrorsMapToClientStatusCodes(t *testing.T) {
+	h := &Handler{}
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{&fleet.InvalidRequestError{Err: errors.New("instances must be between 1 and 64")}, http.StatusBadRequest},
+		{&fleet.InsufficientResourcesError{ModelID: "alpha", Err: errors.New("no GPUs")}, http.StatusConflict},
+		{&fleet.ConflictError{}, http.StatusConflict},
+		{errors.New(`unknown model "x"`), http.StatusNotFound},
+	} {
+		recorder := httptest.NewRecorder()
+		h.writeLifecycleResult(recorder, fleet.Operation{}, false, tc.err)
+		if recorder.Code != tc.want {
+			t.Fatalf("%T status = %d, want %d", tc.err, recorder.Code, tc.want)
+		}
+	}
 }

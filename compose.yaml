@@ -1,11 +1,68 @@
+# Fleet controller in Docker. See README "Running the controller in Docker".
+# Fleet never sees the Docker socket: it talks to a filtering proxy over a
+# private unix socket that allows only the Docker API calls Fleet makes.
 services:
+  docker-proxy:
+    image: wollomatic/socket-proxy:1@sha256:3935b709275e4ec35d6ed5a5c4a1f0d01ed31eec5e7234efc3357ecd47689002
+    command:
+      - -proxysocketendpoint=/run/fleet-docker/docker.sock
+      - -proxysocketendpointfilemode=0660
+      - -allowbindmountfrom=${FLEET_ALLOWED_BIND_ROOTS:-/srv/fleet}
+      - -allowHEAD=/_ping
+      - -allowGET=/_ping
+      - -allowGET=/v[0-9.]+/(version|containers/json|containers/[^/]+/json|images/.+/json)
+      - -allowPOST=/v[0-9.]+/(containers/create|containers/[^/]+/(start|stop)|images/create)
+      - -allowDELETE=/v[0-9.]+/containers/[^/]+
+    # The proxy needs the docker group to open the daemon socket; Fleet joins
+    # the same group only to reach the filtered socket.
+    user: "65534:${DOCKER_GID:?set DOCKER_GID to the docker group id}"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - fleet-docker:/run/fleet-docker
+    restart: unless-stopped
+
   lil-fleet:
     build: .
     command: ["-manifest", "/etc/lil-fleet/fleet.json", "-token-file", "/run/secrets/lil-fleet-token"]
-    ports:
-      - "127.0.0.1:8090:8090"
+    # Host networking is required: readiness URLs must be loopback, and with
+    # bridge networking 127.0.0.1 would be Fleet's own container. Keep
+    # api.listen on 127.0.0.1:8090.
+    network_mode: host
+    # Match the owner of per_model cache roots so Fleet can create
+    # <source>/<model-id> directories.
+    user: "${FLEET_UID:-1000}:${FLEET_GID:-1000}"
+    group_add: ["${DOCKER_GID:?set DOCKER_GID to the docker group id}"]
+    environment:
+      DOCKER_HOST: unix:///run/fleet-docker/docker.sock
+      DOCKER_CONFIG: /tmp/docker-config
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # nvidia-smi for topology-aware placement (utility capability only).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [utility]
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - fleet-docker:/run/fleet-docker
       - ./fleet.json:/etc/lil-fleet/fleet.json:ro
+      # Relative seccomp= paths resolve against the manifest directory, and the
+      # Docker CLI reads the profile inside this container.
+      - ./overrides:/etc/lil-fleet/overrides:ro
       - ./.secrets/api-token:/run/secrets/lil-fleet-token:ro
+      # Uncomment so Fleet can create per_model cache subdirectories; the path
+      # inside must equal the host path used in the manifest.
+      # - /srv/fleet/cache:/srv/fleet/cache
+    depends_on: [docker-proxy]
     restart: unless-stopped
+
+volumes:
+  fleet-docker:

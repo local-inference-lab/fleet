@@ -318,7 +318,7 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 				if id == "mimo-v26-flash-mopd-tp4" {
 					wantIPC = "host"
 				}
-				if model.IPC != wantIPC || len(model.SecurityOpt) != 1 || model.SecurityOpt[0] != "seccomp=overrides/seccomp-deepseek-io-uring.json" {
+				if model.IPC != wantIPC || len(model.SecurityOpt) != 1 || model.SecurityOpt[0] != ioUringSeccompOption(t) {
 					t.Fatalf("io_uring profile IPC/security = %q/%v", model.IPC, model.SecurityOpt)
 				}
 			} else if model.IPC != "host" || len(model.SecurityOpt) != 1 || model.SecurityOpt[0] != "seccomp=unconfined" {
@@ -469,12 +469,27 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if got := commandArgValue(t, pro.Command, "--max-num-scheduled-tokens"); got != "2048" {
 		t.Fatalf("MiMo Pro max scheduled tokens = %q, want 2048", got)
 	}
+	if len(pro.Command) < 2 || pro.Command[0] != "serve" || pro.Command[1] != "/model" {
+		t.Fatalf("MiMo Pro command model path = %v, want serve /model", pro.Command)
+	}
+	if commandHasArg(pro.Command, "--load-format") {
+		t.Fatalf("MiMo Pro must use the standard lazy safetensors loader, not a --load-format override: %v", pro.Command)
+	}
+	if got, flash := commandArgValue(t, pro.Command, "--port"), commandArgValue(t, mimo.Command, "--port"); got != "8109" || got != flash {
+		t.Fatalf("MiMo Pro port = %q and Flash port = %q, want shared 8109 guarded by TP8 full-GPU placement", got, flash)
+	}
+	if pro.Environment["CUDA_VISIBLE_DEVICES"] != "0,1,2,3,4,5,6,7" {
+		t.Fatalf("MiMo Pro CUDA_VISIBLE_DEVICES = %q, want all eight logical GPUs", pro.Environment["CUDA_VISIBLE_DEVICES"])
+	}
 	if len(pro.Mounts) == 0 || pro.Mounts[0].Source != "/mnt/llm_stuff/models/MiMo-V2.6-Pro-RL" || pro.Mounts[0].Target != "/model" || !pro.Mounts[0].ReadOnly {
 		t.Fatalf("MiMo Pro model mount = %+v, want read-only Pro checkpoint at /model", pro.Mounts)
 	}
 	proSpeculative := speculativeConfig(t, pro)
 	if proSpeculative["model"] != "/model/dflash" {
 		t.Fatalf("MiMo Pro draft path = %v, want /model/dflash", proSpeculative["model"])
+	}
+	if proSpeculative["method"] != "dflash" || proSpeculative["num_speculative_tokens"] != float64(7) {
+		t.Fatalf("MiMo Pro speculative method/tokens = %v/%v, want dflash/7", proSpeculative["method"], proSpeculative["num_speculative_tokens"])
 	}
 	if proSpeculative["draft_tensor_parallel_size"] != float64(8) {
 		t.Fatalf("MiMo Pro draft TP = %v, want TP8", proSpeculative["draft_tensor_parallel_size"])
@@ -519,7 +534,7 @@ func TestDerivedTP4Profiles(t *testing.T) {
 		})
 	}
 	mopd, _ := cfg.Model("mimo-v26-flash-mopd-tp4")
-	if len(mopd.SecurityOpt) != 1 || mopd.SecurityOpt[0] != "seccomp=overrides/seccomp-deepseek-io-uring.json" {
+	if len(mopd.SecurityOpt) != 1 || mopd.SecurityOpt[0] != ioUringSeccompOption(t) {
 		t.Fatalf("MiMo MOPD security options = %v, want narrow io_uring profile", mopd.SecurityOpt)
 	}
 	if got := speculativeConfig(t, mopd); got["model"] != "/model/dflash" || got["draft_tensor_parallel_size"] != float64(4) {
@@ -543,6 +558,15 @@ func commandArgValue(t *testing.T, command []string, name string) string {
 	}
 	t.Fatalf("command missing %s: %v", name, command)
 	return ""
+}
+
+func commandHasArg(command []string, name string) bool {
+	for _, argument := range command {
+		if argument == name || strings.HasPrefix(argument, name+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func speculativeConfig(t *testing.T, model Model) map[string]any {
@@ -622,5 +646,223 @@ func TestMiMoProEncoderDriverCompatibility(t *testing.T) {
 	}
 	if got := commandArgValue(t, pro.Command, "--mm-encoder-attn-backend"); got != "TRITON_ATTN" {
 		t.Fatalf("MiMo Pro encoder attention backend = %q, want TRITON_ATTN for driver compatibility", got)
+	}
+}
+
+func TestHostNetworkRejectsPublicOrImplicitBinds(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		model   string
+		wantErr string
+	}{
+		{"wildcard", `"command": ["serve", "--host", "0.0.0.0"]`, `--host "0.0.0.0"`},
+		{"ipv6 wildcard with equals", `"command": ["serve", "--host=::"]`, `--host "::"`},
+		{"routable address", `"command": ["serve", "--host", "192.168.1.10"]`, "every host interface"},
+		{"second bind overrides loopback", `"command": ["serve", "--host", "127.0.0.1", "--host=0.0.0.0"]`, `--host "0.0.0.0"`},
+		{"dangling flag", `"command": ["serve", "--host"]`, "--host requires a value"},
+		{"wildcard HOST environment", `"command": ["serve", "--host", "127.0.0.1"], "environment": {"HOST": "0.0.0.0"}`, `HOST="0.0.0.0"`},
+		{"implicit default bind", `"command": ["serve", "--port", "8101"]`, "requires an explicit loopback bind"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeManifest(t, `{
+				"version": 1,
+				"runtime": {},
+				"models": [{"id": "a", "image": "one", "network_mode": "host", `+tc.model+`}]
+			}`))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestHostNetworkAllowsLoopbackBinds(t *testing.T) {
+	for _, bind := range []string{
+		`"command": ["serve", "--host", "127.0.0.1"]`,
+		`"command": ["serve", "--host", "127.0.0.2"]`,
+		`"command": ["serve", "--host=::1"]`,
+		`"command": ["serve", "--host", "[::1]"]`,
+		`"command": ["serve", "--host", "localhost"]`,
+		`"command": ["serve"], "environment": {"HOST": "127.0.0.1"}`,
+	} {
+		t.Run(bind, func(t *testing.T) {
+			loadManifest(t, `{
+				"version": 1,
+				"runtime": {},
+				"models": [{"id": "a", "image": "one", "network_mode": "host", `+bind+`}]
+			}`)
+		})
+	}
+	// Bridge networking publishes through Docker's loopback-default port
+	// mapping, so a container-local wildcard bind remains valid.
+	loadManifest(t, `{
+		"version": 1,
+		"runtime": {},
+		"models": [{"id": "a", "image": "one", "command": ["serve", "--host", "0.0.0.0"]}]
+	}`)
+}
+
+func TestShippedManifestsKeepHostNetworkListenersOnLoopback(t *testing.T) {
+	for _, name := range []string{"fleet.b12x.json", "fleet.example.json"} {
+		cfg, err := Load(filepath.Join("..", "..", name))
+		if err != nil {
+			t.Fatalf("Load(%s) error = %v", name, err)
+		}
+		for _, model := range cfg.Models {
+			if model.NetworkMode != "host" {
+				continue
+			}
+			binds := 0
+			for index, argument := range model.Command {
+				if argument == "--host" && index+1 < len(model.Command) {
+					binds++
+					if model.Command[index+1] != "127.0.0.1" {
+						t.Fatalf("%s %s binds %q", name, model.ID, model.Command[index+1])
+					}
+				}
+			}
+			if host, ok := model.Environment["HOST"]; ok {
+				binds++
+				if host != "127.0.0.1" {
+					t.Fatalf("%s %s HOST=%q", name, model.ID, host)
+				}
+			}
+			if binds == 0 {
+				t.Fatalf("%s %s has no explicit loopback bind", name, model.ID)
+			}
+		}
+	}
+}
+
+func ioUringSeccompOption(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.Abs(filepath.Join("..", "..", "overrides", "seccomp-deepseek-io-uring.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return "seccomp=" + path
+}
+
+func TestLoadAnchorsRelativeSeccompProfilesToManifestDirectory(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "overrides"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "overrides", "profile.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "fleet.json")
+	body := `{"version": 1, "runtime": {}, "models": [
+		{"id": "a", "image": "one", "security_opt": ["seccomp=overrides/profile.json", "seccomp=unconfined", "label=disable"]}
+	]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(t.TempDir())
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"seccomp=" + filepath.Join(dir, "overrides", "profile.json"), "seccomp=unconfined", "label=disable"}
+	if got := cfg.Models[0].SecurityOpt; !reflect.DeepEqual(got, want) {
+		t.Fatalf("security_opt = %v, want %v", got, want)
+	}
+
+	missing := writeManifest(t, `{"version": 1, "runtime": {}, "models": [
+		{"id": "a", "image": "one", "security_opt": ["seccomp=missing.json"]}
+	]}`)
+	if _, err := Load(missing); err == nil || !strings.Contains(err.Error(), "seccomp profile") {
+		t.Fatalf("Load(missing seccomp) error = %v", err)
+	}
+}
+
+func TestLoadRejectsDockerOptionInjection(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		model   string
+		wantErr string
+	}{
+		{"image option", `"image": "--privileged"`, "image must not start with '-'"},
+		{"image whitespace", `"image": "alpine --privileged"`, "image must not start with '-'"},
+		{"entrypoint option", `"image": "one", "entrypoint": "--privileged"`, "entrypoint must not start"},
+		{"mount source comma", `"image": "one", "mounts": [{"source": "/data,readonly=false", "target": "/data", "read_only": true}]`, "must not contain commas"},
+		{"mount target comma", `"image": "one", "mounts": [{"source": "/data", "target": "/data,bind-propagation=shared"}]`, "must not contain commas"},
+		{"mount newline", `"image": "one", "mounts": [{"source": "/data\n", "target": "/data"}]`, "must not contain commas"},
+		{"publish host ip", `"image": "one", "ports": [{"host_ip": "0.0.0.0:1:1/tcp,", "host_port": 1, "container_port": 1}]`, "host_ip must be an IP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeManifest(t, `{"version": 1, "runtime": {}, "models": [{"id": "a", `+tc.model+`}]}`))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadValidatesContainerHardeningOverrides(t *testing.T) {
+	cfg := loadManifest(t, `{"version": 1, "runtime": {}, "models": [{
+		"id": "a", "image": "one", "cap_add": ["DAC_OVERRIDE", "CAP_SYS_NICE"], "user": "1000:1000", "read_only": true,
+		"mounts": [{"source": "/srv/cache", "target": "/cache", "per_model": true}]
+	}]}`)
+	model := cfg.Models[0]
+	if !slices.Equal(model.CapAdd, []string{"DAC_OVERRIDE", "CAP_SYS_NICE"}) || model.User != "1000:1000" || !model.ReadOnly || !model.Mounts[0].PerModel {
+		t.Fatalf("hardening overrides not preserved: %+v", model)
+	}
+	for _, tc := range []struct {
+		name    string
+		model   string
+		wantErr string
+	}{
+		{"all capabilities", `"cap_add": ["ALL"]`, "cap_add entry"},
+		{"lowercase capability", `"cap_add": ["sys_admin"]`, "cap_add entry"},
+		{"user option", `"user": "--privileged"`, "user must be"},
+		{"read-only per-model mount", `"mounts": [{"source": "/srv/cache", "target": "/cache", "read_only": true, "per_model": true}]`, "per_model applies only"},
+		{"environment key with equals", `"environment": {"A=B": "c"}`, "environment key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeManifest(t, `{"version": 1, "runtime": {}, "models": [{"id": "a", "image": "one", `+tc.model+`}]}`))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Load error = %v, want containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestB12XWritableCachesArePerModel(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, model := range cfg.Models {
+		for _, mount := range model.Mounts {
+			if mount.Source == "/mnt/llm_stuff/cache" && !mount.PerModel {
+				t.Fatalf("%s shares the writable cache root %s", model.ID, mount.Source)
+			}
+		}
+		if !model.Privileged && !slices.Equal(model.CapAdd, []string{"DAC_OVERRIDE"}) {
+			t.Fatalf("%s cap_add = %v, want only DAC_OVERRIDE for the owner-only cache root", model.ID, model.CapAdd)
+		}
+	}
+}
+
+func TestRuntimeStopAndPullTimeouts(t *testing.T) {
+	cfg := loadManifest(t, `{"version": 1, "runtime": {"operation_timeout": "30s"}, "models": [
+		{"id": "a", "image": "one"}, {"id": "b", "image": "one", "stop_timeout": "2m"}
+	]}`)
+	a, _ := cfg.Model("a")
+	b, _ := cfg.Model("b")
+	if cfg.Runtime.StopDuration(a) != 30*time.Second || cfg.Runtime.PullDuration() != 30*time.Minute {
+		t.Fatalf("default stop/pull = %s/%s", cfg.Runtime.StopDuration(a), cfg.Runtime.PullDuration())
+	}
+	// A Docker stop timeout longer than Fleet's deadline would be cut short.
+	if got := cfg.Runtime.StopDuration(b); got != 2*time.Minute+15*time.Second {
+		t.Fatalf("stop deadline for 2m container stop timeout = %s", got)
+	}
+	cfg = loadManifest(t, `{"version": 1, "runtime": {"stop_timeout": "5m", "pull_timeout": "2h"}, "models": [{"id": "a", "image": "one"}]}`)
+	if cfg.Runtime.StopDuration(cfg.Models[0]) != 5*time.Minute || cfg.Runtime.PullDuration() != 2*time.Hour {
+		t.Fatalf("configured stop/pull = %s/%s", cfg.Runtime.StopDuration(cfg.Models[0]), cfg.Runtime.PullDuration())
+	}
+	if _, err := Load(writeManifest(t, `{"version": 1, "runtime": {"stop_timeout": "0s"}, "models": [{"id": "a", "image": "one"}]}`)); err == nil {
+		t.Fatal("zero stop_timeout accepted")
 	}
 }

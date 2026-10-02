@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -20,6 +21,8 @@ var (
 	reservedReplicaID  = regexp.MustCompile(`--([2-9]|[1-5][0-9]|6[0-4])$`)
 	validRestartPolicy = regexp.MustCompile(`^(no|always|unless-stopped|on-failure(:[1-9][0-9]*)?)$`)
 	validMemoryLimit   = regexp.MustCompile(`^[1-9][0-9]*[bBkKmMgGtTpP]?$`)
+	validCapability    = regexp.MustCompile(`^(CAP_)?[A-Z][A-Z0-9_]*$`)
+	validUser          = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]*)?$`)
 )
 
 type Manifest struct {
@@ -38,6 +41,8 @@ type RuntimeConfig struct {
 	PollInterval          string      `json:"poll_interval"`
 	OperationTimeout      string      `json:"operation_timeout"`
 	ReadinessTimeout      string      `json:"readiness_timeout"`
+	StopTimeout           string      `json:"stop_timeout,omitempty"`
+	PullTimeout           string      `json:"pull_timeout,omitempty"`
 	RemoveOnUnload        bool        `json:"remove_on_unload"`
 	ConcurrentDeployments bool        `json:"concurrent_deployments,omitempty"`
 	GPUTopology           GPUTopology `json:"gpu_topology,omitempty"`
@@ -45,6 +50,8 @@ type RuntimeConfig struct {
 	pollInterval          time.Duration
 	operationTimeout      time.Duration
 	readinessTimeout      time.Duration
+	stopTimeout           time.Duration
+	pullTimeout           time.Duration
 }
 
 type PortRange struct {
@@ -78,6 +85,9 @@ type Model struct {
 	Restart         string            `json:"restart,omitempty"`
 	Init            bool              `json:"init,omitempty"`
 	Privileged      bool              `json:"privileged,omitempty"`
+	CapAdd          []string          `json:"cap_add,omitempty"`
+	User            string            `json:"user,omitempty"`
+	ReadOnly        bool              `json:"read_only,omitempty"`
 	StopTimeout     string            `json:"stop_timeout,omitempty"`
 	Readiness       *Readiness        `json:"readiness,omitempty"`
 	stopTimeout     time.Duration
@@ -97,6 +107,9 @@ type Mount struct {
 	Source   string `json:"source"`
 	Target   string `json:"target"`
 	ReadOnly bool   `json:"read_only,omitempty"`
+	// PerModel binds <source>/<model-id> instead of the shared source so
+	// writable caches are not shared between profiles.
+	PerModel bool `json:"per_model,omitempty"`
 }
 
 type Port struct {
@@ -137,7 +150,56 @@ func Load(path string) (*Manifest, error) {
 	if err := m.validate(); err != nil {
 		return nil, err
 	}
+	if err := m.resolveSeccompProfiles(filepath.Dir(path)); err != nil {
+		return nil, err
+	}
 	return &m, nil
+}
+
+// resolveSeccompProfiles anchors relative seccomp profile paths to the manifest
+// directory. The Docker CLI reads the profile client-side relative to its own
+// working directory, which differs between a source checkout, a systemd unit,
+// and the controller container, so a relative path would silently depend on
+// how Fleet was launched.
+func (m *Manifest) resolveSeccompProfiles(manifestDir string) error {
+	base, err := filepath.Abs(manifestDir)
+	if err != nil {
+		return fmt.Errorf("resolve manifest directory: %w", err)
+	}
+	for i := range m.Models {
+		model := &m.Models[i]
+		for j, option := range model.SecurityOpt {
+			profile, ok := SeccompProfilePath(option)
+			if !ok {
+				continue
+			}
+			if !filepath.IsAbs(profile) {
+				profile = filepath.Join(base, profile)
+			}
+			info, err := os.Stat(profile)
+			if err != nil {
+				return fmt.Errorf("model %q: seccomp profile: %w", model.ID, err)
+			}
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf("model %q: seccomp profile %q is not a regular file", model.ID, profile)
+			}
+			model.SecurityOpt[j] = "seccomp=" + profile
+		}
+	}
+	return nil
+}
+
+// SeccompProfilePath returns the file referenced by a seccomp security option,
+// or false for non-seccomp options and the built-in "unconfined" profile.
+func SeccompProfilePath(option string) (string, bool) {
+	name, value, ok := strings.Cut(option, "=")
+	if !ok {
+		name, value, ok = strings.Cut(option, ":")
+	}
+	if !ok || name != "seccomp" || value == "" || value == "unconfined" || value == "builtin" {
+		return "", false
+	}
+	return value, true
 }
 
 func ensureEOF(decoder *json.Decoder) error {
@@ -170,6 +232,12 @@ func (m *Manifest) validate() error {
 	}
 	if m.Runtime.readinessTimeout, err = durationOrDefault(m.Runtime.ReadinessTimeout, 10*time.Minute); err != nil {
 		return fmt.Errorf("runtime.readiness_timeout: %w", err)
+	}
+	if m.Runtime.stopTimeout, err = durationOrDefault(m.Runtime.StopTimeout, m.Runtime.operationTimeout); err != nil {
+		return fmt.Errorf("runtime.stop_timeout: %w", err)
+	}
+	if m.Runtime.pullTimeout, err = durationOrDefault(m.Runtime.PullTimeout, 30*time.Minute); err != nil {
+		return fmt.Errorf("runtime.pull_timeout: %w", err)
 	}
 	if len(m.Models) == 0 {
 		return errors.New("manifest must define at least one model")
@@ -213,10 +281,21 @@ func (m *Manifest) validate() error {
 		if strings.TrimSpace(model.Image) == "" {
 			return fmt.Errorf("model %q: image is required", model.ID)
 		}
+		// The image is the first positional docker-create argument; a leading
+		// dash would be parsed as another Docker option.
+		if strings.HasPrefix(model.Image, "-") || strings.ContainsFunc(model.Image, unsafeArgumentRune) {
+			return fmt.Errorf("model %q: image must not start with '-' or contain whitespace or control characters", model.ID)
+		}
+		if strings.HasPrefix(model.Entrypoint, "-") {
+			return fmt.Errorf("model %q: entrypoint must not start with '-'", model.ID)
+		}
 		if model.Restart != "" && !validRestartPolicy.MatchString(model.Restart) {
 			return fmt.Errorf("model %q: invalid restart policy %q", model.ID, model.Restart)
 		}
 		if err := validateMemoryLimits(model); err != nil {
+			return err
+		}
+		if err := validateContainerIdentity(model); err != nil {
 			return err
 		}
 		if model.StopTimeout != "" {
@@ -254,6 +333,14 @@ func (m *Manifest) validate() error {
 			if !strings.HasPrefix(mount.Source, "/") || !strings.HasPrefix(mount.Target, "/") {
 				return fmt.Errorf("model %q mount %d: source and target must be absolute", model.ID, j)
 			}
+			if mount.PerModel && mount.ReadOnly {
+				return fmt.Errorf("model %q mount %d: per_model applies only to writable mounts", model.ID, j)
+			}
+			// --mount is a comma-separated key=value list; a comma in a path
+			// would inject extra mount options such as a writable bind.
+			if strings.ContainsAny(mount.Source+mount.Target, ",\"") || strings.ContainsFunc(mount.Source+mount.Target, unsafeArgumentRune) {
+				return fmt.Errorf("model %q mount %d: source and target must not contain commas, quotes, or control characters", model.ID, j)
+			}
 		}
 		for j := range model.Ports {
 			port := &model.Ports[j]
@@ -263,6 +350,9 @@ func (m *Manifest) validate() error {
 			if port.HostIP == "" {
 				port.HostIP = "127.0.0.1"
 			}
+			if net.ParseIP(port.HostIP) == nil {
+				return fmt.Errorf("model %q port %d: host_ip must be an IP address", model.ID, j)
+			}
 			if port.Protocol == "" {
 				port.Protocol = "tcp"
 			}
@@ -271,6 +361,11 @@ func (m *Manifest) validate() error {
 			}
 			if m.Runtime.ModelPortRange != nil && !m.Runtime.ModelPortRange.Contains(port.HostPort) {
 				return fmt.Errorf("model %q port %d: host port %d is outside runtime.model_port_range", model.ID, j, port.HostPort)
+			}
+		}
+		if model.NetworkMode == "host" {
+			if err := validateHostNetworkBind(*model); err != nil {
+				return fmt.Errorf("model %q: %w", model.ID, err)
 			}
 		}
 		if model.Readiness != nil {
@@ -299,6 +394,27 @@ func (m *Manifest) validate() error {
 	}
 	sort.Slice(m.Models, func(i, j int) bool { return m.Models[i].ID < m.Models[j].ID })
 	return nil
+}
+
+func validateContainerIdentity(model *Model) error {
+	for _, capability := range model.CapAdd {
+		if !validCapability.MatchString(capability) || strings.TrimPrefix(capability, "CAP_") == "ALL" {
+			return fmt.Errorf("model %q: cap_add entry %q must name one Linux capability; use privileged for all capabilities", model.ID, capability)
+		}
+	}
+	if model.User != "" && !validUser.MatchString(model.User) {
+		return fmt.Errorf("model %q: user must be a name or uid with an optional :group", model.ID)
+	}
+	for key, value := range model.Environment {
+		if key == "" || strings.ContainsAny(key, "=\x00") || strings.ContainsFunc(key, unsafeArgumentRune) || strings.ContainsRune(value, 0) {
+			return fmt.Errorf("model %q: environment key %q is not a valid variable name", model.ID, key)
+		}
+	}
+	return nil
+}
+
+func unsafeArgumentRune(r rune) bool {
+	return r < 0x20 || r == 0x7f || r == ' ' || r == '\t'
 }
 
 func validateMemoryLimits(model *Model) error {
@@ -397,6 +513,53 @@ func commandPort(command []string) (int, error) {
 	return port, nil
 }
 
+// validateHostNetworkBind keeps host-networked inference servers off public
+// interfaces. Host networking has no publish step, so a server bound to 0.0.0.0
+// or :: is reachable, unauthenticated, from every network the host joins. vLLM,
+// lil-serve, and the GLM serve scripts all default to 0.0.0.0, so an absent bind
+// is treated as public too.
+func validateHostNetworkBind(model Model) error {
+	explicit := false
+	for index := 0; index < len(model.Command); index++ {
+		value := ""
+		switch argument := model.Command[index]; {
+		case argument == "--host":
+			if index+1 >= len(model.Command) {
+				return errors.New("--host requires a value")
+			}
+			index++
+			value = model.Command[index]
+		case strings.HasPrefix(argument, "--host="):
+			value = strings.TrimPrefix(argument, "--host=")
+		default:
+			continue
+		}
+		explicit = true
+		if !isLoopbackHost(value) {
+			return fmt.Errorf("network_mode \"host\" would expose --host %q on every host interface; bind to 127.0.0.1 or ::1", value)
+		}
+	}
+	if value, ok := model.Environment["HOST"]; ok {
+		explicit = true
+		if !isLoopbackHost(value) {
+			return fmt.Errorf("network_mode \"host\" would expose HOST=%q on every host interface; bind to 127.0.0.1 or ::1", value)
+		}
+	}
+	if !explicit {
+		return errors.New("network_mode \"host\" requires an explicit loopback bind (--host 127.0.0.1 or environment HOST=127.0.0.1) because model servers default to all interfaces")
+	}
+	return nil
+}
+
+func isLoopbackHost(value string) bool {
+	host := strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(value), "["), "]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func validateReadinessURL(modelID, raw string, servePort int, portRange PortRange) error {
 	parsed, err := url.Parse(raw)
 	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
@@ -448,6 +611,21 @@ func parseStopTimeout(value string) (time.Duration, error) {
 func (r RuntimeConfig) PollDuration() time.Duration      { return r.pollInterval }
 func (r RuntimeConfig) OperationDuration() time.Duration { return r.operationTimeout }
 func (r RuntimeConfig) ReadinessDuration() time.Duration { return r.readinessTimeout }
+func (r RuntimeConfig) PullDuration() time.Duration      { return r.pullTimeout }
+
+// StopDuration bounds one docker stop/rm for model. It is at least the model's
+// own Docker stop timeout plus a grace period, so Fleet never abandons a stop
+// that Docker is still allowed to wait for.
+func (r RuntimeConfig) StopDuration(model Model) time.Duration {
+	limit := r.stopTimeout
+	if limit == 0 {
+		limit = r.operationTimeout
+	}
+	if minimum := time.Duration(model.StopTimeoutSeconds())*time.Second + 15*time.Second; model.StopTimeoutSeconds() > 0 && limit < minimum {
+		return minimum
+	}
+	return limit
+}
 
 func (m Model) StopTimeoutSeconds() int {
 	d := m.stopTimeout

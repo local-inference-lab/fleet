@@ -166,6 +166,11 @@ func (h *Handler) writeLifecycleResult(w http.ResponseWriter, op fleet.Operation
 			writeError(w, http.StatusConflict, "insufficient_resources", err.Error(), nil)
 			return
 		}
+		var invalid *fleet.InvalidRequestError
+		if errors.As(err, &invalid) {
+			writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
+			return
+		}
 		writeError(w, http.StatusNotFound, "model_not_found", err.Error(), nil)
 		return
 	}

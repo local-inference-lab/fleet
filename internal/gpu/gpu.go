@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Device struct {
@@ -31,7 +32,16 @@ func NewNVIDIAProvider(binary string) NVIDIAProvider {
 	return NVIDIAProvider{Binary: binary}
 }
 
+// DefaultSnapshotTimeout bounds nvidia-smi when the caller set no deadline; a
+// wedged driver otherwise hangs the query indefinitely.
+const DefaultSnapshotTimeout = 10 * time.Second
+
 func (p NVIDIAProvider) Snapshot(ctx context.Context) ([]Device, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, DefaultSnapshotTimeout)
+		defer cancel()
+	}
 	out, err := exec.CommandContext(ctx, p.Binary,
 		"--query-gpu=index,memory.used,memory.free",
 		"--format=csv,noheader,nounits",

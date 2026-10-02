@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"reflect"
@@ -55,9 +56,10 @@ type Status struct {
 }
 
 type InstanceStatus struct {
-	InstanceID   string    `json:"instance_id"`
-	Index        int       `json:"index"`
-	Port         int       `json:"port,omitempty"`
+	InstanceID string `json:"instance_id"`
+	Index      int    `json:"index"`
+	// Port is always present: API clients (llmconduit) treat it as required.
+	Port         int       `json:"port"`
 	Phase        Phase     `json:"phase"`
 	Container    string    `json:"container_status,omitempty"`
 	Health       string    `json:"health,omitempty"`
@@ -97,19 +99,59 @@ func (e *InsufficientResourcesError) Error() string {
 
 func (e *InsufficientResourcesError) Unwrap() error { return e.Err }
 
+// InvalidRequestError reports a lifecycle request that can never succeed as
+// written (for example an out-of-range replica count).
+type InvalidRequestError struct {
+	Err error
+}
+
+func (e *InvalidRequestError) Error() string { return e.Err.Error() }
+func (e *InvalidRequestError) Unwrap() error { return e.Err }
+
+const (
+	// gpuSnapshotTimeout bounds nvidia-smi on the request path; it runs
+	// without the manager lock so a slow driver cannot freeze status reads.
+	gpuSnapshotTimeout = 5 * time.Second
+	// loadingPollInterval is how often an activation checks readiness, so a
+	// model becomes routable within about a second of its health turning green.
+	loadingPollInterval = time.Second
+	// probeTimeout bounds one readiness HTTP probe; probes run in parallel.
+	probeTimeout = 2 * time.Second
+	// maxParallelProbes bounds concurrent readiness probes per reconcile.
+	maxParallelProbes = 16
+	// operationTTL and maxOperations bound the finished-operation history.
+	operationTTL  = time.Hour
+	maxOperations = 256
+)
+
 type Manager struct {
 	manifest *manifest.Manifest
 	driver   deployment.Driver
 	gpus     gpu.Provider
 	logger   *slog.Logger
 	client   *http.Client
+	now      func() time.Time
 
+	// mu guards the maps below and is only held for in-memory work, never
+	// across Docker, nvidia-smi, or readiness I/O.
 	mu         sync.RWMutex
 	statuses   map[string]Status
 	operations map[string]Operation
-	inFlight   string
-	cancel     context.CancelFunc
-	done       chan struct{}
+	// inFlight maps a model ID to its running lifecycle operation. With
+	// concurrent deployments each model has at most one operation; without
+	// them the map holds at most one entry in total (exclusive switching).
+	inFlight map[string]string
+	// generations is bumped by every lifecycle write to a model's status so
+	// reconciliation can discard results observed before that write.
+	generations map[string]uint64
+
+	// lifecycleMu serializes container stop/create/start across operations so
+	// two GPU-heavy profiles never start at the same instant. It is released
+	// before the (potentially very long) readiness wait.
+	lifecycleMu sync.Mutex
+
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
 func NewManager(cfg *manifest.Manifest, driver deployment.Driver, logger *slog.Logger) *Manager {
@@ -122,14 +164,17 @@ func NewManagerWithGPUProvider(cfg *manifest.Manifest, driver deployment.Driver,
 		statuses[model.ID] = Status{ModelID: model.ID, Phase: PhaseUnknown, Desired: "unloaded"}
 	}
 	return &Manager{
-		manifest:   cfg,
-		driver:     driver,
-		gpus:       provider,
-		logger:     logger,
-		client:     &http.Client{Timeout: 3 * time.Second},
-		statuses:   statuses,
-		operations: make(map[string]Operation),
-		done:       make(chan struct{}),
+		manifest:    cfg,
+		driver:      driver,
+		gpus:        provider,
+		logger:      logger,
+		client:      &http.Client{Timeout: 3 * time.Second},
+		now:         func() time.Time { return time.Now().UTC() },
+		statuses:    statuses,
+		operations:  make(map[string]Operation),
+		inFlight:    make(map[string]string),
+		generations: make(map[string]uint64),
+		done:        make(chan struct{}),
 	}
 }
 
@@ -202,10 +247,6 @@ func maxInstancesForManifest(cfg *manifest.Manifest, model manifest.Model) int {
 	return limit
 }
 
-func (m *Manager) portCapacityLocked(model manifest.Model) int {
-	return portCapacityForManifest(m.manifest, model)
-}
-
 func portCapacityForManifest(cfg *manifest.Manifest, model manifest.Model) int {
 	if cfg.Runtime.ModelPortRange == nil {
 		return 1
@@ -234,7 +275,7 @@ func (m *Manager) ReloadManifest(next *manifest.Manifest) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.inFlight != "" {
+	if len(m.inFlight) != 0 {
 		return errors.New("a lifecycle operation is in progress")
 	}
 	if next.API.Listen != m.manifest.API.Listen {
@@ -343,59 +384,131 @@ func (m *Manager) Operation(id string) (Operation, bool) {
 	return op, ok
 }
 
+// inFlightLocked applies the lifecycle admission rules. A request identical to
+// the model's running operation joins it (dup); any other request for that
+// model conflicts. Without concurrent deployments, every operation is
+// exclusive: a request for any model conflicts with a running one.
+func (m *Manager) inFlightLocked(cfg *manifest.Manifest, modelID, kind string, requested *int) (Operation, bool, error) {
+	if id, ok := m.inFlight[modelID]; ok {
+		op := m.operations[id]
+		if op.Kind == kind && (kind != "activate" || requested == nil || op.TargetInstances == *requested) {
+			return op, true, nil
+		}
+		return Operation{}, false, &ConflictError{Operation: op}
+	}
+	if !cfg.Runtime.ConcurrentDeployments {
+		for _, id := range m.inFlight {
+			return Operation{}, false, &ConflictError{Operation: m.operations[id]}
+		}
+	}
+	return Operation{}, false, nil
+}
+
+// ownedLocked reports whether a running operation is responsible for the
+// model's status; reconciliation must not overwrite it meanwhile.
+func (m *Manager) ownedLocked(modelID string) bool {
+	if _, ok := m.inFlight[modelID]; ok {
+		return true
+	}
+	return !m.manifest.Runtime.ConcurrentDeployments && len(m.inFlight) != 0
+}
+
 func (m *Manager) Activate(modelID string) (Operation, bool, error) {
 	return m.ActivateInstances(modelID, nil)
 }
 
 func (m *Manager) ActivateInstances(modelID string, requested *int) (Operation, bool, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		op, noOp, retry, err := m.tryActivate(modelID, requested)
+		if !retry {
+			return op, noOp, err
+		}
+	}
+	return Operation{}, false, &ConflictError{}
+}
+
+// tryActivate admits an activation in two short critical sections around the
+// GPU snapshot: nvidia-smi can be slow, so it runs unlocked, and everything it
+// informs (admission, reservations, allocation) is re-evaluated afterwards.
+func (m *Manager) tryActivate(modelID string, requested *int) (Operation, bool, bool, error) {
 	m.mu.Lock()
 	cfg := m.manifest
 	model, ok := cfg.Model(modelID)
 	if !ok {
 		m.mu.Unlock()
-		return Operation{}, false, fmt.Errorf("unknown model %q", modelID)
+		return Operation{}, false, false, fmt.Errorf("unknown model %q", modelID)
 	}
-	if m.inFlight != "" {
-		op := m.operations[m.inFlight]
-		if op.Kind == "activate" && op.ModelID == modelID && (requested == nil || op.TargetInstances == *requested) {
-			m.mu.Unlock()
-			return op, true, nil
-		}
+	op, dup, err := m.activationPreflightLocked(cfg, model, requested)
+	m.mu.Unlock()
+	if op.Kind == "noop" {
+		return Operation{}, true, false, nil
+	}
+	if err != nil || dup {
+		return op, dup, false, err
+	}
+
+	var devices []gpu.Device
+	var snapshotErr error
+	if model.Placement != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), gpuSnapshotTimeout)
+		devices, snapshotErr = m.gpus.Snapshot(ctx)
+		cancel()
+	}
+
+	m.mu.Lock()
+	if m.manifest != cfg {
 		m.mu.Unlock()
-		return Operation{}, false, &ConflictError{Operation: op}
+		return Operation{}, false, true, nil
 	}
-	target := m.targetInstancesLocked(modelID, requested)
-	if target < 1 || target > maxRequestedInstances {
+	op, dup, err = m.activationPreflightLocked(cfg, model, requested)
+	if op.Kind == "noop" {
 		m.mu.Unlock()
-		return Operation{}, false, fmt.Errorf("instances must be between 1 and %d", maxRequestedInstances)
+		return Operation{}, true, false, nil
 	}
-	if target > m.maxInstancesLocked(model) {
+	if err != nil || dup {
 		m.mu.Unlock()
-		err := fmt.Errorf("requested %d instances, maximum is %d", target, m.maxInstancesLocked(model))
-		m.logger.Error("model load failed", "model_id", modelID, "error", err)
-		return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
+		return op, dup, false, err
 	}
-	plan, err := m.planInstancesLocked(cfg, model, target)
+	target := op.TargetInstances
+	plan, err := m.planInstancesLocked(cfg, model, target, devices, snapshotErr)
 	if err != nil {
 		m.mu.Unlock()
-		m.logger.Error("model load failed", "model_id", modelID, "error", err)
-		return Operation{}, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
-	}
-	if m.isReadyNoopLocked(modelID, cfg, target) {
-		status := m.statuses[modelID]
-		status.Desired = "ready"
-		status.DesiredInstances = target
-		m.statuses[modelID] = status
-		m.mu.Unlock()
-		return Operation{}, true, nil
+		m.logger.Error("model load failed", "model_id", modelID, "error", sanitizeFor(model, err.Error()))
+		return Operation{}, false, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
 	}
 	m.markPlanLocked(modelID, plan)
-	op := newOperation("activate", modelID, target)
-	m.operations[op.ID] = op
-	m.inFlight = op.ID
+	op = newOperation("activate", modelID, target, m.now())
+	m.addOperationLocked(op)
 	m.mu.Unlock()
 	go m.runActivate(op.ID, cfg, model, plan)
-	return op, false, nil
+	return op, false, false, nil
+}
+
+// activationPreflightLocked returns a joined duplicate operation, a "noop"
+// marker for an already-satisfied request, or a pending operation shell whose
+// TargetInstances is the validated replica target.
+func (m *Manager) activationPreflightLocked(cfg *manifest.Manifest, model manifest.Model, requested *int) (Operation, bool, error) {
+	op, dup, err := m.inFlightLocked(cfg, model.ID, "activate", requested)
+	if err != nil || dup {
+		return op, dup, err
+	}
+	target := m.targetInstancesLocked(model.ID, requested)
+	if target < 1 || target > maxRequestedInstances {
+		return Operation{}, false, &InvalidRequestError{Err: fmt.Errorf("instances must be between 1 and %d", maxRequestedInstances)}
+	}
+	if max := m.maxInstancesLocked(model); target > max {
+		err := fmt.Errorf("requested %d instances, maximum is %d", target, max)
+		m.logger.Error("model load failed", "model_id", model.ID, "error", err)
+		return Operation{}, false, &InsufficientResourcesError{ModelID: model.ID, Err: err}
+	}
+	if m.isReadyNoopLocked(model.ID, cfg, target) {
+		status := m.statuses[model.ID]
+		status.Desired = "ready"
+		status.DesiredInstances = target
+		m.statuses[model.ID] = status
+		return Operation{Kind: "noop"}, false, nil
+	}
+	return Operation{Kind: "activate", TargetInstances: target}, false, nil
 }
 
 func (m *Manager) isReadyNoopLocked(modelID string, cfg *manifest.Manifest, target int) bool {
@@ -428,7 +541,7 @@ func (m *Manager) targetInstancesLocked(modelID string, requested *int) int {
 	return 1
 }
 
-func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Model, target int) (instancePlan, error) {
+func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Model, target int, devices []gpu.Device, snapshotErr error) (instancePlan, error) {
 	current := sortedInstances(m.statuses[model.ID].Instances)
 	currentByIndex := map[int]InstanceStatus{}
 	kept := map[int]bool{}
@@ -469,18 +582,18 @@ func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Mod
 	if err != nil {
 		return instancePlan{}, err
 	}
-	var devices []gpu.Device
 	var allocator gpu.Allocator
 	var reserved []int
 	if model.Placement != nil {
-		devices, err = m.gpus.Snapshot(context.Background())
-		if err != nil {
-			return instancePlan{}, err
+		if snapshotErr != nil {
+			return instancePlan{}, snapshotErr
 		}
 		allocator = gpu.Allocator{Topology: gpu.Topology{
 			Groups:           cfg.Runtime.GPUTopology.Groups,
 			MaxUsedMemoryMiB: cfg.Runtime.GPUTopology.MaxUsedMemoryMiB,
 		}}
+		// Reservations come from current state, not the snapshot, so GPUs
+		// promised to another in-flight activation are never handed out twice.
 		reserved = m.reservedGPUsForPlanLocked(cfg, model.ID)
 	}
 	for _, index := range startIndexes {
@@ -532,7 +645,7 @@ func (m *Manager) allocatePortsLocked(model manifest.Model, needed int) ([]int, 
 	if m.manifest.Runtime.ModelPortRange == nil {
 		return nil, errors.New("runtime.model_port_range is required for multiple instances")
 	}
-	configured := m.configuredBasePortsLocked()
+	configured := configuredBasePorts(m.manifest)
 	reserved := m.reservedPortsLocked()
 	var ports []int
 	for port := m.manifest.Runtime.ModelPortRange.Start; port <= m.manifest.Runtime.ModelPortRange.End; port++ {
@@ -545,10 +658,6 @@ func (m *Manager) allocatePortsLocked(model manifest.Model, needed int) ([]int, 
 		}
 	}
 	return nil, fmt.Errorf("need %d extra ports, found %d", needed, len(ports))
-}
-
-func (m *Manager) configuredBasePortsLocked() map[int]bool {
-	return configuredBasePorts(m.manifest)
 }
 
 func configuredBasePorts(cfg *manifest.Manifest) map[int]bool {
@@ -590,10 +699,6 @@ func (m *Manager) activePortOwnerLocked(exceptModelID string, port int) (string,
 	return "", false
 }
 
-func (m *Manager) reservedGPUsLocked(exceptModelID string) []int {
-	return m.reservedGPUsForPlanLocked(m.manifest, exceptModelID)
-}
-
 func (m *Manager) reservedGPUsForPlanLocked(cfg *manifest.Manifest, exceptModelID string) []int {
 	var reserved []int
 	for id, status := range m.statuses {
@@ -621,7 +726,7 @@ func (m *Manager) reservedGPUsForPlanLocked(cfg *manifest.Manifest, exceptModelI
 }
 
 func (m *Manager) markPlanLocked(modelID string, plan instancePlan) {
-	now := time.Now().UTC()
+	now := m.now()
 	instances := append([]InstanceStatus(nil), plan.keep...)
 	for _, start := range plan.start {
 		instances = append(instances, InstanceStatus{
@@ -637,7 +742,7 @@ func (m *Manager) markPlanLocked(modelID string, plan instancePlan) {
 	}
 	status := aggregateStatus(modelID, "ready", instances, false)
 	status.DesiredInstances = plan.target
-	m.statuses[modelID] = status
+	m.writeStatusLocked(status)
 }
 
 func (m *Manager) Unload(modelID string) (Operation, bool, error) {
@@ -648,39 +753,66 @@ func (m *Manager) Unload(modelID string) (Operation, bool, error) {
 		m.mu.Unlock()
 		return Operation{}, false, fmt.Errorf("unknown model %q", modelID)
 	}
-	if m.inFlight != "" {
-		op := m.operations[m.inFlight]
-		if op.Kind == "unload" && op.ModelID == modelID {
-			m.mu.Unlock()
-			return op, true, nil
-		}
+	if op, dup, err := m.inFlightLocked(cfg, modelID, "unload", nil); err != nil || dup {
 		m.mu.Unlock()
-		return Operation{}, false, &ConflictError{Operation: op}
+		return op, dup, err
 	}
-	if status := m.statuses[modelID]; status.Phase == PhaseUnloaded && status.Container == "" {
+	if status := m.statuses[modelID]; status.Phase == PhaseUnloaded && status.Container == "" && len(status.Instances) == 0 {
 		status.Desired = "unloaded"
 		m.statuses[modelID] = status
 		m.mu.Unlock()
 		return Operation{}, true, nil
 	}
-	op := newOperation("unload", modelID, 0)
-	m.operations[op.ID] = op
-	m.inFlight = op.ID
+	op := newOperation("unload", modelID, 0, m.now())
+	m.addOperationLocked(op)
+	m.transitionLocked(modelID, PhaseStopping, "unloaded")
 	m.mu.Unlock()
 	go m.runUnload(op.ID, cfg, model)
 	return op, false, nil
 }
 
-func newOperation(kind, modelID string, targetInstances int) Operation {
+func newOperation(kind, modelID string, targetInstances int, now time.Time) Operation {
 	buf := make([]byte, 12)
 	if _, err := rand.Read(buf); err != nil {
 		panic(fmt.Sprintf("generate operation id: %v", err))
 	}
-	return Operation{ID: hex.EncodeToString(buf), Kind: kind, ModelID: modelID, TargetInstances: targetInstances, State: "pending", CreatedAt: time.Now().UTC()}
+	return Operation{ID: hex.EncodeToString(buf), Kind: kind, ModelID: modelID, TargetInstances: targetInstances, State: "pending", CreatedAt: now}
+}
+
+func (m *Manager) addOperationLocked(op Operation) {
+	m.evictOperationsLocked()
+	m.operations[op.ID] = op
+	m.inFlight[op.ModelID] = op.ID
+}
+
+// evictOperationsLocked drops finished operations older than operationTTL and
+// then the oldest finished ones beyond maxOperations. Running operations are
+// never evicted, so a client polling one always finds it.
+func (m *Manager) evictOperationsLocked() {
+	now := m.now()
+	var finished []Operation
+	for id, op := range m.operations {
+		if op.FinishedAt == nil {
+			continue
+		}
+		if now.Sub(*op.FinishedAt) > operationTTL {
+			delete(m.operations, id)
+			continue
+		}
+		finished = append(finished, op)
+	}
+	excess := len(m.operations) - (maxOperations - 1)
+	if excess <= 0 {
+		return
+	}
+	sort.Slice(finished, func(i, j int) bool { return finished[i].FinishedAt.Before(*finished[j].FinishedAt) })
+	for i := 0; i < excess && i < len(finished); i++ {
+		delete(m.operations, finished[i].ID)
+	}
 }
 
 func (m *Manager) beginOperation(id string) {
-	now := time.Now().UTC()
+	now := m.now()
 	m.mu.Lock()
 	op := m.operations[id]
 	op.State = "running"
@@ -692,31 +824,38 @@ func (m *Manager) beginOperation(id string) {
 func (m *Manager) finishOperation(id string, err error) {
 	m.mu.RLock()
 	op := m.operations[id]
-	m.mu.RUnlock()
+	message := ""
 	if err != nil {
-		if op.Kind == "unload" {
-			m.logger.Error("model unload failed", "model_id", op.ModelID, "operation_id", id, "error", err)
-		} else {
-			m.logger.Error("model load failed", "model_id", op.ModelID, "operation_id", id, "error", err)
-		}
-	} else if op.Kind == "unload" {
+		message = m.sanitizeLocked(op.ModelID, err.Error())
+	}
+	m.mu.RUnlock()
+	// Log before publishing the terminal state so an observer that sees the
+	// finished operation also sees its log record.
+	switch {
+	case err != nil && op.Kind == "unload":
+		m.logger.Error("model unload failed", "model_id", op.ModelID, "operation_id", id, "error", message)
+	case err != nil:
+		m.logger.Error("model load failed", "model_id", op.ModelID, "operation_id", id, "error", message)
+	case op.Kind == "unload":
 		m.logger.Info("model unloaded", "model_id", op.ModelID, "operation_id", id)
-	} else {
+	default:
 		m.logger.Info("model loaded", "model_id", op.ModelID, "operation_id", id)
 	}
 
-	now := time.Now().UTC()
+	now := m.now()
 	m.mu.Lock()
+	op = m.operations[id]
 	op.State = "succeeded"
 	if err != nil {
 		op.State = "failed"
-		op.Error = err.Error()
+		op.Error = message
 	}
 	op.FinishedAt = &now
 	m.operations[id] = op
-	if m.inFlight == id {
-		m.inFlight = ""
+	if m.inFlight[op.ModelID] == id {
+		delete(m.inFlight, op.ModelID)
 	}
+	m.evictOperationsLocked()
 	m.mu.Unlock()
 }
 
@@ -726,37 +865,49 @@ func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.Runtime.ReadinessDuration())
 	defer cancel()
 
-	if !cfg.Runtime.ConcurrentDeployments {
-		for _, other := range cfg.Models {
-			if other.ID == modelID {
-				continue
-			}
-			wasLoaded := m.currentStatus(other.ID).Phase != PhaseUnloaded
-			m.updateTransition(other.ID, PhaseStopping, "unloaded")
-			opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
-			err := m.stopAllInstances(opCtx, other, cfg.Runtime.RemoveOnUnload)
-			opCancel()
+	if len(plan.start) != 0 {
+		if puller, ok := m.driver.(deployment.ImagePuller); ok {
+			pullCtx, pullCancel := context.WithTimeout(ctx, cfg.Runtime.PullDuration())
+			err := puller.EnsureImage(pullCtx, model.Image)
+			pullCancel()
 			if err != nil {
-				m.setFailure(other.ID, err)
-				m.logger.Error("model unload failed", "model_id", other.ID, "operation_id", operationID, "error", err)
-				m.finishOperation(operationID, fmt.Errorf("unload %s before switch: %w", other.ID, err))
+				for _, start := range plan.start {
+					m.setInstanceFailure(modelID, start.index, err)
+				}
+				m.finishOperation(operationID, err)
 				return
-			}
-			m.setUnloaded(other.ID)
-			if wasLoaded {
-				m.logger.Info("model unloaded", "model_id", other.ID, "operation_id", operationID)
 			}
 		}
 	}
 
+	m.lifecycleMu.Lock()
+	err := m.applyPlan(ctx, operationID, cfg, model, plan)
+	m.lifecycleMu.Unlock()
+	if err != nil {
+		m.finishOperation(operationID, err)
+		return
+	}
+	m.awaitReady(ctx, operationID, cfg, model, plan.target)
+}
+
+// applyPlan performs the container mutations of an activation while holding
+// lifecycleMu: an exclusive switch first stops every other model that has
+// containers (in parallel), then surplus replicas stop and new ones start.
+func (m *Manager) applyPlan(ctx context.Context, operationID string, cfg *manifest.Manifest, model manifest.Model, plan instancePlan) error {
+	modelID := model.ID
+	if !cfg.Runtime.ConcurrentDeployments {
+		if err := m.stopOtherModels(ctx, operationID, cfg, modelID); err != nil {
+			return err
+		}
+	}
+
 	for _, stop := range plan.stop {
-		opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.OperationDuration())
+		opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.StopDuration(model))
 		err := m.driver.Stop(opCtx, stop.model, cfg.Runtime.RemoveOnUnload)
 		opCancel()
 		if err != nil {
 			m.setFailure(modelID, err)
-			m.finishOperation(operationID, err)
-			return
+			return err
 		}
 		m.removeInstance(modelID, stop.index)
 	}
@@ -768,31 +919,81 @@ func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model 
 		opCancel()
 		if err != nil {
 			m.setInstanceFailure(modelID, start.index, err)
-			m.finishOperation(operationID, err)
-			return
+			return err
 		}
 	}
+	return nil
+}
 
-	ticker := time.NewTicker(cfg.Runtime.PollDuration())
+func (m *Manager) stopOtherModels(ctx context.Context, operationID string, cfg *manifest.Manifest, modelID string) error {
+	var others []manifest.Model
+	for _, other := range cfg.Models {
+		if other.ID == modelID {
+			continue
+		}
+		status := m.currentStatus(other.ID)
+		// A model observed with no containers has nothing to stop; Unknown
+		// (never inspected) is stopped defensively.
+		if status.Phase == PhaseUnloaded && len(status.Instances) == 0 {
+			continue
+		}
+		others = append(others, other)
+	}
+	errs := make([]error, len(others))
+	var wg sync.WaitGroup
+	for i, other := range others {
+		m.updateTransition(other.ID, PhaseStopping, "unloaded")
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			opCtx, opCancel := context.WithTimeout(ctx, cfg.Runtime.StopDuration(other))
+			defer opCancel()
+			errs[i] = m.stopAllInstances(opCtx, other, cfg.Runtime.RemoveOnUnload)
+		}()
+	}
+	wg.Wait()
+	var failed error
+	for i, other := range others {
+		if errs[i] != nil {
+			m.setFailure(other.ID, errs[i])
+			m.logger.Error("model unload failed", "model_id", other.ID, "operation_id", operationID, "error", sanitizeFor(other, errs[i].Error()))
+			if failed == nil {
+				failed = fmt.Errorf("unload %s before switch: %w", other.ID, errs[i])
+			}
+			continue
+		}
+		m.setUnloaded(other.ID)
+		m.logger.Info("model unloaded", "model_id", other.ID, "operation_id", operationID)
+	}
+	return failed
+}
+
+func (m *Manager) awaitReady(ctx context.Context, operationID string, cfg *manifest.Manifest, model manifest.Model, target int) {
+	modelID := model.ID
+	interval := cfg.Runtime.PollDuration()
+	if interval > loadingPollInterval {
+		interval = loadingPollInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		status := m.probe(ctx, model, cfg.Runtime)
-		if status.ReadyInstances == plan.target && status.Phase == PhaseReady {
+		status := m.observeModel(ctx, cfg, model)
+		if status.ReadyInstances == target && status.Phase == PhaseReady {
 			status.Desired = "ready"
-			status.DesiredInstances = plan.target
+			status.DesiredInstances = target
 			m.storeStatus(status)
 			m.finishOperation(operationID, nil)
 			return
 		}
 		if status.Phase == PhaseFailed || (status.Phase == PhaseUnloaded && status.ExitCode != 0) {
+			status.Desired = "ready"
 			m.storeStatus(status)
-			err := fmt.Errorf("model %s exited before becoming ready", modelID)
-			m.finishOperation(operationID, err)
+			m.finishOperation(operationID, fmt.Errorf("model %s exited before becoming ready", modelID))
 			return
 		}
 		status.Phase = PhaseLoading
 		status.Desired = "ready"
-		status.DesiredInstances = plan.target
+		status.DesiredInstances = target
 		m.storeStatus(status)
 		select {
 		case <-ctx.Done():
@@ -808,8 +1009,7 @@ func (m *Manager) runActivate(operationID string, cfg *manifest.Manifest, model 
 func (m *Manager) runUnload(operationID string, cfg *manifest.Manifest, model manifest.Model) {
 	modelID := model.ID
 	m.beginOperation(operationID)
-	m.updateTransition(modelID, PhaseStopping, "unloaded")
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Runtime.OperationDuration())
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.Runtime.StopDuration(model))
 	defer cancel()
 	if err := m.stopAllInstances(ctx, model, cfg.Runtime.RemoveOnUnload); err != nil {
 		m.setFailure(modelID, err)
@@ -820,23 +1020,34 @@ func (m *Manager) runUnload(operationID string, cfg *manifest.Manifest, model ma
 	m.finishOperation(operationID, nil)
 }
 
+// refresh reconciles every model's status from one container listing plus
+// parallel readiness probes. A result is discarded when a lifecycle write
+// happened while it was being observed (generation changed) or when a running
+// operation owns the model's status.
 func (m *Manager) refresh(ctx context.Context) {
 	m.mu.RLock()
 	cfg := m.manifest
-	m.mu.RUnlock()
+	generations := make(map[string]uint64, len(cfg.Models))
+	desired := make(map[string]string, len(cfg.Models))
 	for _, model := range cfg.Models {
-		status := m.probe(ctx, model, cfg.Runtime)
-		m.mu.RLock()
-		if m.manifest != cfg {
-			m.mu.RUnlock()
-			return
-		}
-		current := m.statuses[model.ID]
-		if m.inFlight != "" && m.operations[m.inFlight].ModelID == model.ID {
-			m.mu.RUnlock()
+		generations[model.ID] = m.generations[model.ID]
+		desired[model.ID] = m.statuses[model.ID].Desired
+	}
+	m.mu.RUnlock()
+
+	observed := m.observe(ctx, cfg, cfg.Models, desired)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.manifest != cfg || ctx.Err() != nil {
+		return
+	}
+	for _, model := range cfg.Models {
+		if m.generations[model.ID] != generations[model.ID] || m.ownedLocked(model.ID) {
 			continue
 		}
-		m.mu.RUnlock()
+		current := m.statuses[model.ID]
+		status := observed[model.ID]
 		// On restart, recover intent from an existing running container. Unknown
 		// also covers a failed first inspection; explicit stopping intent stays intact.
 		if current.Phase == PhaseUnknown && current.Desired == "unloaded" &&
@@ -856,120 +1067,154 @@ func (m *Manager) refresh(ctx context.Context) {
 			status.Phase = PhaseStopping
 			status.Desired = "unloaded"
 		}
-		m.mu.Lock()
-		if m.manifest != cfg {
-			m.mu.Unlock()
-			return
-		}
-		latest := m.statuses[model.ID]
-		if m.inFlight != "" && m.operations[m.inFlight].ModelID == model.ID {
-			m.mu.Unlock()
-			continue
-		}
-		if latest.Phase != current.Phase || latest.LastChecked != current.LastChecked || latest.DesiredInstances != current.DesiredInstances {
-			m.mu.Unlock()
-			continue
-		}
-		m.statuses[status.ModelID] = status
-		m.mu.Unlock()
+		m.statuses[model.ID] = status
 	}
 }
 
-func (m *Manager) probe(parent context.Context, model manifest.Model, runtime manifest.RuntimeConfig) Status {
-	ctx, cancel := context.WithTimeout(parent, runtime.OperationDuration())
-	defer cancel()
-	m.mu.RLock()
-	current := m.statuses[model.ID]
-	current = cloneStatus(current)
-	maxInstances := m.maxInstancesLocked(model)
-	if knownMax := maxInstanceIndex(current); knownMax > maxInstances {
-		maxInstances = knownMax
-	}
-	m.mu.RUnlock()
-	desired := current.Desired
-	if desired == "" {
-		desired = "unloaded"
-	}
-	knownPorts := map[int]int{1: basePort(model)}
-	for _, instance := range current.Instances {
-		if instance.Port != 0 {
-			knownPorts[instance.Index] = instance.Port
-		}
-	}
-	var instances []InstanceStatus
-	for index := 1; index <= maxInstances; index++ {
-		port := knownPorts[index]
-		status, found := m.probeInstance(ctx, model, runtime, index, port)
-		if found {
-			instances = append(instances, status)
-		}
-	}
-	status := aggregateStatus(model.ID, desired, instances, true)
-	if len(instances) == 0 {
-		status.LastChecked = time.Now().UTC()
-	}
-	return status
+// observeModel is refresh for one model, used while an activation waits.
+func (m *Manager) observeModel(ctx context.Context, cfg *manifest.Manifest, model manifest.Model) Status {
+	return m.observe(ctx, cfg, []manifest.Model{model}, map[string]string{model.ID: "ready"})[model.ID]
 }
 
-func (m *Manager) probeInstance(parent context.Context, model manifest.Model, runtime manifest.RuntimeConfig, index, port int) (InstanceStatus, bool) {
-	now := time.Now().UTC()
-	instanceModel := cloneInstanceModel(model, index, port)
-	state, err := m.driver.Inspect(parent, instanceModel)
-	if errors.Is(err, deployment.ErrNotFound) {
-		return InstanceStatus{}, false
+type probeTarget struct {
+	modelID  string
+	position int
+	url      string
+	success  int
+	model    manifest.Model
+}
+
+func (m *Manager) observe(ctx context.Context, cfg *manifest.Manifest, models []manifest.Model, desired map[string]string) map[string]Status {
+	now := m.now()
+	states, listErr := m.driver.List(ctx)
+	byModel := map[string][]deployment.ContainerState{}
+	for _, state := range states {
+		byModel[state.ModelID] = append(byModel[state.ModelID], state)
+	}
+
+	instances := make(map[string][]InstanceStatus, len(models))
+	var probes []probeTarget
+	for _, model := range models {
+		if listErr != nil {
+			instances[model.ID] = []InstanceStatus{{
+				InstanceID: model.ID, Index: 1, Port: basePort(model), Phase: PhaseUnknown,
+				LastError: sanitizeFor(model, listErr.Error()), LastChecked: now,
+			}}
+			continue
+		}
+		modelDesired := desired[model.ID]
+		for _, state := range byModel[model.ID] {
+			instance, needsProbe := instanceFromState(model, state, modelDesired, now)
+			instances[model.ID] = append(instances[model.ID], instance)
+			if needsProbe {
+				probeModel := cloneInstanceModel(model, instance.Index, instance.Port)
+				probes = append(probes, probeTarget{
+					modelID: model.ID, position: len(instances[model.ID]) - 1,
+					url: probeModel.Readiness.URL, success: probeModel.Readiness.SuccessStatus, model: model,
+				})
+			}
+		}
+	}
+
+	results := make([]string, len(probes))
+	semaphore := make(chan struct{}, maxParallelProbes)
+	var wg sync.WaitGroup
+	for i, probe := range probes {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+			results[i] = m.probeReadiness(ctx, probe.url, probe.success)
+		}()
+	}
+	wg.Wait()
+	for i, probe := range probes {
+		instance := &instances[probe.modelID][probe.position]
+		if results[i] != "" {
+			instance.Phase = PhaseUnhealthy
+			instance.LastError = sanitizeFor(probe.model, results[i])
+			continue
+		}
+		instance.Phase = PhaseReady
+	}
+
+	statuses := make(map[string]Status, len(models))
+	for _, model := range models {
+		modelDesired := desired[model.ID]
+		if modelDesired == "" {
+			modelDesired = "unloaded"
+		}
+		status := aggregateStatus(model.ID, modelDesired, instances[model.ID], true)
+		if len(instances[model.ID]) == 0 {
+			status.LastChecked = now
+		}
+		statuses[model.ID] = status
+	}
+	return statuses
+}
+
+// instanceFromState converts container state to an instance status. It
+// reports whether the instance still needs an HTTP readiness probe.
+func instanceFromState(model manifest.Model, state deployment.ContainerState, desired string, now time.Time) (InstanceStatus, bool) {
+	index := state.InstanceIndex
+	if index < 1 {
+		index = 1
+	}
+	port := state.Port
+	if port == 0 && index == 1 {
+		port = basePort(model)
 	}
 	status := InstanceStatus{
 		InstanceID: instanceID(model.ID, index), Index: index, Port: port,
-		LastChecked: now,
+		Container: state.Status, Health: state.Health, ExitCode: state.ExitCode, OOMKilled: state.OOMKilled,
+		AssignedGPUs: append([]int(nil), state.AssignedGPUs...),
+		LastError:    sanitizeFor(model, state.Error), LastChecked: now,
 	}
-	if state.Port != 0 {
-		status.Port = state.Port
-		instanceModel = cloneInstanceModel(model, index, state.Port)
-	}
-	if err != nil {
-		status.Phase = PhaseUnknown
-		status.LastError = err.Error()
-		return status, true
-	}
-	status.Container = state.Status
-	status.Health = state.Health
-	status.ExitCode = state.ExitCode
-	status.OOMKilled = state.OOMKilled
-	status.AssignedGPUs = append([]int(nil), state.AssignedGPUs...)
-	status.LastError = state.Error
 	if !state.Running {
 		status.Phase = PhaseUnloaded
-		if state.ExitCode != 0 || state.OOMKilled || state.Error != "" {
+		if (state.ExitCode != 0 || state.OOMKilled || state.Error != "") && !requestedStopExit(state, desired) {
 			status.Phase = PhaseFailed
 		}
-		return status, true
+		return status, false
 	}
 	if state.Health == "unhealthy" {
 		status.Phase = PhaseUnhealthy
-		return status, true
+		return status, false
 	}
-	if instanceModel.Readiness != nil {
-		request, requestErr := http.NewRequestWithContext(parent, http.MethodGet, instanceModel.Readiness.URL, nil)
-		if requestErr != nil {
-			status.Phase = PhaseUnhealthy
-			status.LastError = requestErr.Error()
-			return status, true
-		}
-		response, requestErr := m.client.Do(request)
-		if requestErr != nil {
-			status.Phase = PhaseUnhealthy
-			status.LastError = requestErr.Error()
-			return status, true
-		}
-		response.Body.Close()
-		if response.StatusCode != instanceModel.Readiness.SuccessStatus {
-			status.Phase = PhaseUnhealthy
-			status.LastError = fmt.Sprintf("readiness returned HTTP %d", response.StatusCode)
-			return status, true
-		}
+	if model.Readiness == nil {
+		status.Phase = PhaseReady
+		return status, false
 	}
-	status.Phase = PhaseReady
+	status.Phase = PhaseUnhealthy
 	return status, true
+}
+
+// requestedStopExit recognizes the exit codes of a container Fleet asked to
+// stop: 143 (SIGTERM honored) or 137 (SIGKILL after the stop timeout). They are
+// a clean unload, not a failure, unless the kernel OOM killer was involved.
+func requestedStopExit(state deployment.ContainerState, desired string) bool {
+	return desired == "unloaded" && !state.OOMKilled && state.Error == "" &&
+		(state.ExitCode == 137 || state.ExitCode == 143)
+}
+
+func (m *Manager) probeReadiness(parent context.Context, url string, success int) string {
+	ctx, cancel := context.WithTimeout(parent, probeTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err.Error()
+	}
+	response, err := m.client.Do(request)
+	if err != nil {
+		return err.Error()
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 64<<10))
+	response.Body.Close()
+	if response.StatusCode != success {
+		return fmt.Sprintf("readiness returned HTTP %d", response.StatusCode)
+	}
+	return ""
 }
 
 func (m *Manager) currentStatus(modelID string) Status {
@@ -978,30 +1223,42 @@ func (m *Manager) currentStatus(modelID string) Status {
 	return cloneStatus(m.statuses[modelID])
 }
 
+// writeStatusLocked is the single lifecycle write path: it stores the status
+// and bumps the model's generation so in-progress reconciliation drops its
+// now-stale observation.
+func (m *Manager) writeStatusLocked(status Status) {
+	m.statuses[status.ModelID] = status
+	m.generations[status.ModelID]++
+}
+
 func (m *Manager) storeStatus(status Status) {
 	m.mu.Lock()
-	m.statuses[status.ModelID] = status
+	m.writeStatusLocked(status)
 	m.mu.Unlock()
 }
 
 func (m *Manager) updateTransition(modelID string, phase Phase, desired string) {
 	m.mu.Lock()
+	m.transitionLocked(modelID, phase, desired)
+	m.mu.Unlock()
+}
+
+func (m *Manager) transitionLocked(modelID string, phase Phase, desired string) {
 	status := m.statuses[modelID]
 	status.Phase = phase
 	status.Desired = desired
 	status.LastError = ""
-	status.LastChecked = time.Now().UTC()
-	m.statuses[modelID] = status
-	m.mu.Unlock()
+	status.LastChecked = m.now()
+	m.writeStatusLocked(status)
 }
 
 func (m *Manager) setFailure(modelID string, err error) {
 	m.mu.Lock()
 	status := m.statuses[modelID]
 	status.Phase = PhaseFailed
-	status.LastError = err.Error()
-	status.LastChecked = time.Now().UTC()
-	m.statuses[modelID] = status
+	status.LastError = m.sanitizeLocked(modelID, err.Error())
+	status.LastChecked = m.now()
+	m.writeStatusLocked(status)
 	m.mu.Unlock()
 }
 
@@ -1011,13 +1268,12 @@ func (m *Manager) setInstancePhase(modelID string, index int, phase Phase, err s
 	for i := range status.Instances {
 		if status.Instances[i].Index == index {
 			status.Instances[i].Phase = phase
-			status.Instances[i].LastError = err
-			status.Instances[i].LastChecked = time.Now().UTC()
+			status.Instances[i].LastError = m.sanitizeLocked(modelID, err)
+			status.Instances[i].LastChecked = m.now()
 			break
 		}
 	}
-	status = aggregateStatus(modelID, status.Desired, status.Instances, false)
-	m.statuses[modelID] = status
+	m.writeStatusLocked(aggregateStatus(modelID, status.Desired, status.Instances, false))
 	m.mu.Unlock()
 }
 
@@ -1034,26 +1290,48 @@ func (m *Manager) removeInstance(modelID string, index int) {
 			instances = append(instances, instance)
 		}
 	}
-	status = aggregateStatus(modelID, status.Desired, instances, true)
-	m.statuses[modelID] = status
+	m.writeStatusLocked(aggregateStatus(modelID, status.Desired, instances, true))
 	m.mu.Unlock()
 }
 
 func (m *Manager) setUnloaded(modelID string) {
-	m.storeStatus(Status{ModelID: modelID, Phase: PhaseUnloaded, Desired: "unloaded", LastChecked: time.Now().UTC()})
+	m.storeStatus(Status{ModelID: modelID, Phase: PhaseUnloaded, Desired: "unloaded", LastChecked: m.now()})
 }
 
+// stopAllInstances stops a model's replicas in parallel; each stop is bounded
+// by ctx, which callers derive from runtime.stop_timeout.
 func (m *Manager) stopAllInstances(ctx context.Context, model manifest.Model, remove bool) error {
 	status := m.currentStatus(model.ID)
 	instances := sortedInstances(status.Instances)
 	if len(instances) == 0 {
 		instances = []InstanceStatus{{InstanceID: model.ID, Index: 1, Port: basePort(model)}}
 	}
-	for i := len(instances) - 1; i >= 0; i-- {
-		instance := instances[i]
-		if err := m.driver.Stop(ctx, cloneInstanceModel(model, instance.Index, instance.Port), remove); err != nil {
-			return err
-		}
+	errs := make([]error, len(instances))
+	var wg sync.WaitGroup
+	for i, instance := range instances {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = m.driver.Stop(ctx, cloneInstanceModel(model, instance.Index, instance.Port), remove)
+		}()
 	}
-	return nil
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
+// sanitizeLocked prepares Docker, runtime, or probe error text for the API by
+// redacting the model's manifest environment values and bounding its size.
+func (m *Manager) sanitizeLocked(modelID, message string) string {
+	if message == "" {
+		return ""
+	}
+	model, _ := m.manifest.Model(modelID)
+	return sanitizeFor(model, message)
+}
+
+func sanitizeFor(model manifest.Model, message string) string {
+	if message == "" {
+		return ""
+	}
+	return deployment.SanitizeMessage(message, deployment.EnvironmentValues(model))
 }

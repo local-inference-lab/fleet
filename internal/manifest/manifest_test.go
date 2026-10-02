@@ -302,7 +302,7 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 		t.Fatal("qwen38-flash-next-qad5500-tp4 missing")
 	} else {
 		args := strings.Join(qad.Command, " ")
-		for _, want := range []string{"--model /models/Qwen3.8-Flash-Next-NVFP4-QAD-5500", "--served-model-name Qwen3.8-Flash-Next-QAD-5500", "--port 8115", "--no-language-model-only"} {
+		for _, want := range []string{"--model /models/Qwen3.8-Flash-Next-NVFP4-QAD-5500", "--served-model-name Qwen3.8-Flash-Next-QAD-5500", "--port 8115", "--no-language-model-only", `--hf-overrides {"text_config":{"ple_embedding_dtype":"nvfp4"}}`} {
 			if !strings.Contains(args, want) {
 				t.Fatalf("qad5500 command %q lacks %q", args, want)
 			}

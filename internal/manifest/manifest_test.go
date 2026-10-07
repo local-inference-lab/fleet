@@ -526,7 +526,7 @@ func TestDerivedTP4Profiles(t *testing.T) {
 		{"swift15-flash-next-nvfp4-tp4", "lil-fleet/b12x:f20ab3bad7de", "/mnt/llm_stuff/models/Swift-1.5-Qwen3.8-Flash-Next-NVFP4", "Swift-1.5-Flash-Next-NVFP4", "8112"},
 		{"mimo-v26-flash-mopd-tp4", "local/mimo-v26-pro:karmic-kraken-av-20260926", "/mnt/llm_stuff/models/MiMo-V2.6-Flash-MOPD", "MiMo-V2.6-Flash-MOPD", "8113"},
 		{"qwen38-flash-next-qad4000-tp4", "lil-fleet/b12x:f20ab3bad7de", "/mnt/llm_stuff/models/Qwen3.8-Flash-Next-NVFP4-QAD-4000", "Qwen3.8-Flash-Next-QAD-4000", "8110"},
-		{"glm53-flash-qad-tvn3500-tp4", "lil-fleet/glm53-flash:mixed-device-20260924", "/mnt/llm_stuff/models/GLM-5.3-Flash-NVFP4-QAD-TVN-3500", "GLM-5.3-Flash-NVFP4-QAD-TVN-3500", "8111"},
+		{"glm53-flash-qad-tvn3500-tp4", "lil-fleet/glm53-flash:mixed-device-20260924", "/mnt/llm_stuff/models/GLM-5.3-Flash-NVFP4-QAD-3500-Latest", "GLM-5.3-Flash-NVFP4-QAD-TVN-3500", "8111"},
 	} {
 		t.Run(test.id, func(t *testing.T) {
 			model, ok := cfg.Model(test.id)

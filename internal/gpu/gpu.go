@@ -96,72 +96,188 @@ type Allocator struct {
 
 var ErrInsufficient = errors.New("insufficient available GPUs")
 
+// candidate is one topology-valid GPU set under consideration.
+type candidate struct {
+	picked  []int // ascending
+	total   int   // summed MemoryFreeMiB
+	minimum int   // smallest per-GPU MemoryFreeMiB
+	groups  []int // group order used to build it, for deterministic ties
+}
+
+// Allocate picks count GPUs, excluding reserved ones and any above the
+// topology's MaxUsedMemoryMiB. Among every placement the topology allows
+// (count <= 4: one group; 6: a full four-GPU group plus two from another; 8:
+// every group; no topology: any GPUs) it returns the one with the most total
+// free memory, breaking ties by the larger per-GPU minimum and then by lowest
+// group order and index. The result is in ascending index order, which is how
+// it lands in the container's GPU label and in Docker's device list.
 func (a Allocator) Allocate(devices []Device, count int, reserved []int) ([]int, error) {
 	if count <= 0 {
 		return nil, nil
 	}
-	available := a.availableSet(devices, reserved)
+	free := a.availableFree(devices, reserved)
 	groups := normalizeGroups(a.Topology.Groups)
-	if len(groups) == 0 {
-		return selectFromSorted(available, count)
-	}
 
+	var candidates []candidate
+	if len(groups) == 0 {
+		indexes := make([]int, 0, len(free))
+		for index := range free {
+			indexes = append(indexes, index)
+		}
+		if picked, ok := pickMostFree(free, indexes, count); ok {
+			candidates = append(candidates, newCandidate(free, nil, picked))
+		}
+	} else {
+		candidates = topologyCandidates(free, groups, count)
+	}
+	if len(candidates) == 0 {
+		return nil, fmt.Errorf("%w: need %d GPUs", ErrInsufficient, count)
+	}
+	best := candidates[0]
+	for _, next := range candidates[1:] {
+		if better(next, best) {
+			best = next
+		}
+	}
+	return best.picked, nil
+}
+
+func topologyCandidates(free map[int]int, groups [][]int, count int) []candidate {
+	var candidates []candidate
 	switch {
 	case count <= 4:
-		for _, group := range groups {
-			if picked, ok := selectFromGroup(available, group, count); ok {
-				return picked, nil
+		for i, group := range groups {
+			if picked, ok := pickMostFree(free, group, count); ok {
+				candidates = append(candidates, newCandidate(free, []int{i}, picked))
 			}
 		}
 	case count == 6:
 		for i, primary := range groups {
-			full, ok := selectFromGroup(available, primary, len(primary))
-			if !ok || len(full) != 4 {
+			if len(primary) != 4 {
+				continue
+			}
+			full, ok := pickMostFree(free, primary, len(primary))
+			if !ok {
 				continue
 			}
 			for j, secondary := range groups {
 				if i == j {
 					continue
 				}
-				extra, ok := selectFromGroup(available, secondary, 2)
+				extra, ok := pickMostFree(free, secondary, 2)
 				if ok {
-					return append(append([]int{}, full...), extra...), nil
+					candidates = append(candidates, newCandidate(free, []int{i, j}, append(append([]int{}, full...), extra...)))
 				}
 			}
 		}
 	case count == 8:
 		var picked []int
-		for _, group := range groups {
-			part, ok := selectFromGroup(available, group, len(group))
+		order := make([]int, 0, len(groups))
+		for i, group := range groups {
+			part, ok := pickMostFree(free, group, len(group))
 			if !ok {
-				return nil, fmt.Errorf("%w: need %d GPUs", ErrInsufficient, count)
+				return nil
 			}
 			picked = append(picked, part...)
+			order = append(order, i)
 		}
 		if len(picked) == count {
-			return picked, nil
+			candidates = append(candidates, newCandidate(free, order, picked))
 		}
 	}
-	return nil, fmt.Errorf("%w: need %d GPUs", ErrInsufficient, count)
+	return candidates
 }
 
-func (a Allocator) availableSet(devices []Device, reserved []int) map[int]bool {
+// pickMostFree returns the count available indexes from pool with the most
+// free memory (lower index first on ties).
+func pickMostFree(free map[int]int, pool []int, count int) ([]int, bool) {
+	available := make([]int, 0, len(pool))
+	for _, index := range pool {
+		if _, ok := free[index]; ok {
+			available = append(available, index)
+		}
+	}
+	if len(available) < count {
+		return nil, false
+	}
+	sort.Slice(available, func(i, j int) bool {
+		if free[available[i]] != free[available[j]] {
+			return free[available[i]] > free[available[j]]
+		}
+		return available[i] < available[j]
+	})
+	return append([]int(nil), available[:count]...), true
+}
+
+func newCandidate(free map[int]int, groups []int, picked []int) candidate {
+	sort.Ints(picked)
+	c := candidate{picked: picked, groups: groups}
+	for i, index := range picked {
+		c.total += free[index]
+		if i == 0 || free[index] < c.minimum {
+			c.minimum = free[index]
+		}
+	}
+	return c
+}
+
+func better(left, right candidate) bool {
+	if left.total != right.total {
+		return left.total > right.total
+	}
+	if left.minimum != right.minimum {
+		return left.minimum > right.minimum
+	}
+	if c := compareInts(left.groups, right.groups); c != 0 {
+		return c < 0
+	}
+	return compareInts(left.picked, right.picked) < 0
+}
+
+func compareInts(left, right []int) int {
+	for i := 0; i < len(left) && i < len(right); i++ {
+		if left[i] != right[i] {
+			if left[i] < right[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return len(left) - len(right)
+}
+
+// availableFree maps each allocatable GPU to its free memory.
+func (a Allocator) availableFree(devices []Device, reserved []int) map[int]int {
 	reservedSet := make(map[int]bool, len(reserved))
 	for _, index := range reserved {
 		reservedSet[index] = true
 	}
-	maxUsed := a.Topology.MaxUsedMemoryMiB
-	available := make(map[int]bool, len(devices))
+	available := make(map[int]int, len(devices))
 	for _, device := range devices {
-		if reservedSet[device.Index] {
+		if reservedSet[device.Index] || a.Topology.OverThreshold(device) {
 			continue
 		}
-		if maxUsed > 0 && device.MemoryUsedMiB > maxUsed {
-			continue
-		}
-		available[device.Index] = true
+		available[device.Index] = device.MemoryFreeMiB
 	}
 	return available
+}
+
+// OverThreshold reports whether a GPU already uses more memory than the
+// topology allows a new placement to share.
+func (t Topology) OverThreshold(device Device) bool {
+	return t.MaxUsedMemoryMiB > 0 && device.MemoryUsedMiB > t.MaxUsedMemoryMiB
+}
+
+// GroupOf returns the index of the topology group containing gpu.
+func (t Topology) GroupOf(gpu int) (int, bool) {
+	for i, group := range t.Groups {
+		for _, index := range group {
+			if index == gpu {
+				return i, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func normalizeGroups(groups [][]int) [][]int {
@@ -174,29 +290,4 @@ func normalizeGroups(groups [][]int) [][]int {
 		result = append(result, copyGroup)
 	}
 	return result
-}
-
-func selectFromGroup(available map[int]bool, group []int, count int) ([]int, bool) {
-	picked := make([]int, 0, count)
-	for _, index := range group {
-		if available[index] {
-			picked = append(picked, index)
-			if len(picked) == count {
-				return picked, true
-			}
-		}
-	}
-	return nil, false
-}
-
-func selectFromSorted(available map[int]bool, count int) ([]int, error) {
-	indexes := make([]int, 0, len(available))
-	for index := range available {
-		indexes = append(indexes, index)
-	}
-	sort.Ints(indexes)
-	if len(indexes) < count {
-		return nil, fmt.Errorf("%w: need %d GPUs", ErrInsufficient, count)
-	}
-	return indexes[:count], nil
 }

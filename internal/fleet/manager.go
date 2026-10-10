@@ -80,6 +80,12 @@ type Operation struct {
 	CreatedAt       time.Time  `json:"created_at"`
 	StartedAt       *time.Time `json:"started_at,omitempty"`
 	FinishedAt      *time.Time `json:"finished_at,omitempty"`
+	// GPUs is the explicit GPU list a load requested, in request order; empty
+	// for automatic placement.
+	GPUs []int `json:"gpus,omitempty"`
+	// Warnings are non-fatal notes about an explicit GPU selection, such as a
+	// tensor-parallel group spanning PCIe groups.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 type ConflictError struct {
@@ -150,6 +156,10 @@ type Manager struct {
 	// before the (potentially very long) readiness wait.
 	lifecycleMu sync.Mutex
 
+	// gpuCache holds the last nvidia-smi snapshot for the inventory API. It
+	// has its own lock so a slow nvidia-smi never touches mu.
+	gpuCache gpuSnapshotCache
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -209,7 +219,7 @@ func (m *Manager) Models() []ModelInfo {
 	defer m.mu.RUnlock()
 	models := make([]ModelInfo, 0, len(m.manifest.Models))
 	for _, model := range m.manifest.Models {
-		gpuCount := 0
+		gpuCount := staticGPUCount(model.GPUs, m.manifest.Runtime.GPUTopology.Groups)
 		if model.Placement != nil {
 			gpuCount = model.Placement.GPUCount
 		}
@@ -388,10 +398,14 @@ func (m *Manager) Operation(id string) (Operation, bool) {
 // the model's running operation joins it (dup); any other request for that
 // model conflicts. Without concurrent deployments, every operation is
 // exclusive: a request for any model conflicts with a running one.
-func (m *Manager) inFlightLocked(cfg *manifest.Manifest, modelID, kind string, requested *int) (Operation, bool, error) {
+func (m *Manager) inFlightLocked(cfg *manifest.Manifest, modelID, kind string, requested *int, gpus []int) (Operation, bool, error) {
 	if id, ok := m.inFlight[modelID]; ok {
 		op := m.operations[id]
-		if op.Kind == kind && (kind != "activate" || requested == nil || op.TargetInstances == *requested) {
+		sameTarget := requested == nil || op.TargetInstances == *requested
+		// A request without explicit GPUs does not care where the running
+		// operation placed its instances; one with explicit GPUs must match.
+		sameGPUs := len(gpus) == 0 || reflect.DeepEqual(op.GPUs, gpus)
+		if op.Kind == kind && (kind != "activate" || (sameTarget && sameGPUs)) {
 			return op, true, nil
 		}
 		return Operation{}, false, &ConflictError{Operation: op}
@@ -418,8 +432,24 @@ func (m *Manager) Activate(modelID string) (Operation, bool, error) {
 }
 
 func (m *Manager) ActivateInstances(modelID string, requested *int) (Operation, bool, error) {
+	return m.Load(modelID, LoadRequest{Instances: requested})
+}
+
+// LoadRequest is the body of POST /v1/models/{id}/load.
+type LoadRequest struct {
+	// Instances is the exact target replica count; nil keeps the legacy
+	// ensure-loaded behavior.
+	Instances *int
+	// GPUs optionally pins the instances this request starts, gpu_count per
+	// instance in order. Empty means automatic placement.
+	GPUs []int
+}
+
+// Load activates a model, optionally on operator-chosen GPUs.
+func (m *Manager) Load(modelID string, request LoadRequest) (Operation, bool, error) {
+	gpus := append([]int(nil), request.GPUs...)
 	for attempt := 0; attempt < 3; attempt++ {
-		op, noOp, retry, err := m.tryActivate(modelID, requested)
+		op, noOp, retry, err := m.tryActivate(modelID, request.Instances, gpus)
 		if !retry {
 			return op, noOp, err
 		}
@@ -430,7 +460,7 @@ func (m *Manager) ActivateInstances(modelID string, requested *int) (Operation, 
 // tryActivate admits an activation in two short critical sections around the
 // GPU snapshot: nvidia-smi can be slow, so it runs unlocked, and everything it
 // informs (admission, reservations, allocation) is re-evaluated afterwards.
-func (m *Manager) tryActivate(modelID string, requested *int) (Operation, bool, bool, error) {
+func (m *Manager) tryActivate(modelID string, requested *int, gpus []int) (Operation, bool, bool, error) {
 	m.mu.Lock()
 	cfg := m.manifest
 	model, ok := cfg.Model(modelID)
@@ -438,7 +468,15 @@ func (m *Manager) tryActivate(modelID string, requested *int) (Operation, bool, 
 		m.mu.Unlock()
 		return Operation{}, false, false, fmt.Errorf("unknown model %q", modelID)
 	}
-	op, dup, err := m.activationPreflightLocked(cfg, model, requested)
+	if len(gpus) != 0 && model.Placement == nil {
+		m.mu.Unlock()
+		return Operation{}, false, false, gpuSelectionErrorf(GPUErrNotSupported, "model %q has no placement; gpus can only be chosen for topology-placed models", modelID)
+	}
+	if err := validateGPUListShape(gpus); err != nil {
+		m.mu.Unlock()
+		return Operation{}, false, false, err
+	}
+	op, dup, err := m.activationPreflightLocked(cfg, model, requested, gpus)
 	m.mu.Unlock()
 	if op.Kind == "noop" {
 		return Operation{}, true, false, nil
@@ -453,6 +491,7 @@ func (m *Manager) tryActivate(modelID string, requested *int) (Operation, bool, 
 		ctx, cancel := context.WithTimeout(context.Background(), gpuSnapshotTimeout)
 		devices, snapshotErr = m.gpus.Snapshot(ctx)
 		cancel()
+		m.gpuCache.store(devices, snapshotErr, m.now())
 	}
 
 	m.mu.Lock()
@@ -460,7 +499,7 @@ func (m *Manager) tryActivate(modelID string, requested *int) (Operation, bool, 
 		m.mu.Unlock()
 		return Operation{}, false, true, nil
 	}
-	op, dup, err = m.activationPreflightLocked(cfg, model, requested)
+	op, dup, err = m.activationPreflightLocked(cfg, model, requested, gpus)
 	if op.Kind == "noop" {
 		m.mu.Unlock()
 		return Operation{}, true, false, nil
@@ -470,14 +509,22 @@ func (m *Manager) tryActivate(modelID string, requested *int) (Operation, bool, 
 		return op, dup, false, err
 	}
 	target := op.TargetInstances
-	plan, err := m.planInstancesLocked(cfg, model, target, devices, snapshotErr)
+	plan, err := m.planInstancesLocked(cfg, model, target, devices, snapshotErr, gpus)
 	if err != nil {
 		m.mu.Unlock()
 		m.logger.Error("model load failed", "model_id", modelID, "error", sanitizeFor(model, err.Error()))
+		var selection *GPUSelectionError
+		if errors.As(err, &selection) {
+			return Operation{}, false, false, err
+		}
 		return Operation{}, false, false, &InsufficientResourcesError{ModelID: modelID, Err: err}
 	}
 	m.markPlanLocked(modelID, plan)
 	op = newOperation("activate", modelID, target, m.now())
+	if len(gpus) != 0 {
+		op.GPUs = append([]int(nil), gpus...)
+		op.Warnings = plan.warnings
+	}
 	m.addOperationLocked(op)
 	m.mu.Unlock()
 	go m.runActivate(op.ID, cfg, model, plan)
@@ -487,8 +534,8 @@ func (m *Manager) tryActivate(modelID string, requested *int) (Operation, bool, 
 // activationPreflightLocked returns a joined duplicate operation, a "noop"
 // marker for an already-satisfied request, or a pending operation shell whose
 // TargetInstances is the validated replica target.
-func (m *Manager) activationPreflightLocked(cfg *manifest.Manifest, model manifest.Model, requested *int) (Operation, bool, error) {
-	op, dup, err := m.inFlightLocked(cfg, model.ID, "activate", requested)
+func (m *Manager) activationPreflightLocked(cfg *manifest.Manifest, model manifest.Model, requested *int, gpus []int) (Operation, bool, error) {
+	op, dup, err := m.inFlightLocked(cfg, model.ID, "activate", requested, gpus)
 	if err != nil || dup {
 		return op, dup, err
 	}
@@ -500,6 +547,11 @@ func (m *Manager) activationPreflightLocked(cfg *manifest.Manifest, model manife
 		err := fmt.Errorf("requested %d instances, maximum is %d", target, max)
 		m.logger.Error("model load failed", "model_id", model.ID, "error", err)
 		return Operation{}, false, &InsufficientResourcesError{ModelID: model.ID, Err: err}
+	}
+	if len(gpus) != 0 {
+		if err := m.checkGPUCountLocked(model, target, gpus); err != nil {
+			return Operation{}, false, err
+		}
 	}
 	if m.isReadyNoopLocked(model.ID, cfg, target) {
 		status := m.statuses[model.ID]
@@ -541,7 +593,7 @@ func (m *Manager) targetInstancesLocked(modelID string, requested *int) int {
 	return 1
 }
 
-func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Model, target int, devices []gpu.Device, snapshotErr error) (instancePlan, error) {
+func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Model, target int, devices []gpu.Device, snapshotErr error, gpus []int) (instancePlan, error) {
 	current := sortedInstances(m.statuses[model.ID].Instances)
 	currentByIndex := map[int]InstanceStatus{}
 	kept := map[int]bool{}
@@ -563,17 +615,19 @@ func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Mod
 			})
 		}
 	}
+	if len(gpus) != 0 {
+		// State may have changed since preflight; re-check under this lock.
+		if err := m.checkGPUCountLocked(model, target, gpus); err != nil {
+			return instancePlan{}, err
+		}
+	}
 	if len(plan.keep) == target {
 		return plan, nil
 	}
 
-	var startIndexes []int
+	startIndexes := m.startIndexesLocked(model.ID, target)
 	extraPortsNeeded := 0
-	for index := 1; index <= target; index++ {
-		if kept[index] {
-			continue
-		}
-		startIndexes = append(startIndexes, index)
+	for _, index := range startIndexes {
 		if index > 1 && currentByIndex[index].Port == 0 {
 			extraPortsNeeded++
 		}
@@ -596,7 +650,14 @@ func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Mod
 		// promised to another in-flight activation are never handed out twice.
 		reserved = m.reservedGPUsForPlanLocked(cfg, model.ID)
 	}
-	for _, index := range startIndexes {
+	var explicit [][]int
+	if len(gpus) != 0 {
+		explicit, plan.warnings, err = m.validateExplicitGPUsLocked(cfg, model, startIndexes, devices, snapshotErr, gpus)
+		if err != nil {
+			return instancePlan{}, err
+		}
+	}
+	for position, index := range startIndexes {
 		currentInstance := currentByIndex[index]
 		port := basePort(model)
 		if index > 1 {
@@ -610,6 +671,9 @@ func (m *Manager) planInstancesLocked(cfg *manifest.Manifest, model manifest.Mod
 			return instancePlan{}, fmt.Errorf("port %d is already used by %s", port, owner)
 		}
 		assigned := append([]int(nil), currentInstance.AssignedGPUs...)
+		if explicit != nil {
+			assigned = append([]int(nil), explicit[position]...)
+		}
 		if model.Placement != nil {
 			if len(assigned) == 0 {
 				assigned, err = allocator.Allocate(devices, model.Placement.GPUCount, reserved)
@@ -753,7 +817,7 @@ func (m *Manager) Unload(modelID string) (Operation, bool, error) {
 		m.mu.Unlock()
 		return Operation{}, false, fmt.Errorf("unknown model %q", modelID)
 	}
-	if op, dup, err := m.inFlightLocked(cfg, modelID, "unload", nil); err != nil || dup {
+	if op, dup, err := m.inFlightLocked(cfg, modelID, "unload", nil, nil); err != nil || dup {
 		m.mu.Unlock()
 		return op, dup, err
 	}

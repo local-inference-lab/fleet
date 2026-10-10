@@ -54,6 +54,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.handleReady(w)
 	case r.Method == http.MethodGet && path == "v1/models":
 		h.handleModels(w)
+	case r.Method == http.MethodGet && path == "v1/gpus":
+		h.handleGPUs(w, r)
 	case len(parts) == 3 && parts[0] == "v1" && parts[1] == "models" && r.Method == http.MethodGet:
 		h.handleModel(w, parts[2])
 	case len(parts) == 4 && parts[0] == "v1" && parts[1] == "models" && parts[3] == "load" && r.Method == http.MethodPost:
@@ -147,6 +149,16 @@ func (h *Handler) handleActivate(w http.ResponseWriter, r *http.Request, id stri
 	}
 	op, noOp, err := h.manager.ActivateInstances(id, instances)
 	h.writeLifecycleResult(w, op, noOp, err)
+}
+
+func (h *Handler) handleGPUs(w http.ResponseWriter, r *http.Request) {
+	inventory, err := h.manager.GPUInventory(r.Context())
+	if err != nil {
+		h.logger.Error("GPU inventory failed", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "gpu_query_failed", "GPU inventory is unavailable: nvidia-smi query failed", nil)
+		return
+	}
+	writeJSON(w, http.StatusOK, inventory)
 }
 
 func (h *Handler) handleUnload(w http.ResponseWriter, id string) {

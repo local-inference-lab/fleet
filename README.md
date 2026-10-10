@@ -82,6 +82,24 @@ List the configured profiles and their current state:
 curl http://127.0.0.1:8090/v1/models
 ```
 
+Inspect the GPUs, their free memory, PCIe group, and which Fleet deployments hold them:
+
+```sh
+curl http://127.0.0.1:8090/v1/gpus
+```
+
+```json
+{
+  "sampled_at": "2026-10-10T12:00:00Z",
+  "groups": [[0,1,6,7],[2,3,4,5]],
+  "gpus": [
+    {"index": 0, "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "memory_total_mib": 97887, "memory_used_mib": 1234, "memory_free_mib": 96000, "utilization_percent": 0, "group": 0, "assigned": [{"model_id": "ds41-flash-tp4-ssd", "instance_id": "ds41-flash-tp4-ssd"}]}
+  ]
+}
+```
+
+`groups` is the manifest topology (`[]` without one) and `group` indexes into it (`null` for a GPU outside every group). `utilization_percent` is `null` when `nvidia-smi` reports it unavailable. `assigned` lists every Fleet instance holding the GPU, including loading and stopping ones, and is `[]` for a free GPU. The snapshot is reused for about 5 seconds, and concurrent requests share one `nvidia-smi` run, so polling this endpoint does not spawn a process per request. When `nvidia-smi` fails, the last snapshot is returned with `"stale": true` while it is under a minute old; otherwise the response is `503` with code `gpu_query_failed`. Each `/v1/models` entry also reports `gpu_count`: the placement GPU count, or the count implied by a static `gpus` value.
+
 Load a model. By default this is an exclusive switch. When `runtime.concurrent_deployments` is enabled, Fleet allocates free GPUs from the manifest topology and keeps compatible deployments resident. An empty request body keeps the legacy behavior: ensure at least one instance is running, or preserve the current replica count when the model is already scaled above one.
 
 ```sh

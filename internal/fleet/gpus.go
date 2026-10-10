@@ -85,8 +85,9 @@ func (m *Manager) checkGPUCountLocked(model manifest.Model, target int, gpus []i
 }
 
 // validateExplicitGPUsLocked checks an operator's GPU pick against the
-// snapshot and current reservations, and splits it into one ascending GPU
-// list per started instance. Topology group rules are deliberately not
+// snapshot and current reservations, and splits it into one GPU list per
+// started instance. The operator's order is kept: it becomes the Docker device
+// order (and so the rank mapping) and the container label. Topology group rules are deliberately not
 // enforced; a pick spanning groups only produces a warning.
 func (m *Manager) validateExplicitGPUsLocked(cfg *manifest.Manifest, model manifest.Model, startIndexes []int, devices []gpu.Device, snapshotErr error, gpus []int) ([][]int, []string, error) {
 	topology := gpu.Topology{Groups: cfg.Runtime.GPUTopology.Groups, MaxUsedMemoryMiB: cfg.Runtime.GPUTopology.MaxUsedMemoryMiB}
@@ -140,7 +141,6 @@ func (m *Manager) validateExplicitGPUsLocked(cfg *manifest.Manifest, model manif
 	var warnings []string
 	for i, index := range startIndexes {
 		chunk := append([]int(nil), gpus[i*count:(i+1)*count]...)
-		sort.Ints(chunk)
 		perInstance[i] = chunk
 		if count > 4 || len(topology.Groups) == 0 {
 			continue

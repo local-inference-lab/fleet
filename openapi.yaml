@@ -228,8 +228,8 @@ components:
             Optional explicit GPU indices for the instances this request newly starts (only for
             models with placement). Length must equal placement.gpu_count times the number of
             instances started; the first gpu_count indices go to the first new instance, and so on.
-            Each instance's GPUs are stored in ascending order. Empty or omitted means automatic
-            placement.
+            Each instance keeps the listed order as its Docker device order. Empty or omitted means
+            automatic placement.
     GPUInventory:
       type: object
       required: [sampled_at, groups, gpus]

@@ -91,9 +91,13 @@ func TestAllocatorPicksMostFreeVRAM(t *testing.T) {
 		{name: "tp3 picks most free trio", groups: b12xGroups, devices: uneven, count: 3, want: []int{2, 3, 4}},
 		{name: "tp4 picks group with most total free", groups: b12xGroups, devices: uneven, count: 4, want: []int{2, 3, 4, 5}},
 		{name: "tp4 tie takes first group", groups: b12xGroups, devices: even, count: 4, want: []int{0, 1, 6, 7}},
-		{name: "tp6 full group plus most free pair from the other", groups: b12xGroups, devices: uneven, count: 6, want: []int{1, 2, 3, 4, 5, 6}},
-		{name: "tp6 tie is ascending first group plus first pair", groups: b12xGroups, devices: even, count: 6, want: []int{0, 1, 2, 3, 6, 7}},
-		{name: "tp8 takes every GPU in ascending order", groups: b12xGroups, devices: uneven, count: 8, want: []int{0, 1, 2, 3, 4, 5, 6, 7}},
+		// Second group wins: it is the primary, listed first, then the extra
+		// pair in its group's manifest order.
+		{name: "tp6 second group wins and leads", groups: b12xGroups, devices: uneven, count: 6, want: []int{2, 3, 4, 5, 1, 6}},
+		{name: "tp6 tie keeps old traversal order", groups: b12xGroups, devices: even, count: 6, want: []int{0, 1, 6, 7, 2, 3}},
+		{name: "tp8 concatenates groups in manifest order", groups: b12xGroups, devices: uneven, count: 8, want: []int{0, 1, 6, 7, 2, 3, 4, 5}},
+		{name: "tp3 keeps group manifest order", groups: [][]int{{7, 6, 1, 0}, {2, 3, 4, 5}}, devices: devicesWithFree(50, 60, 0, 0, 0, 0, 100, 40), count: 3, want: []int{6, 1, 0}},
+		{name: "tp2 tie keeps group manifest order", groups: [][]int{{7, 6, 1, 0}, {2, 3, 4, 5}}, devices: even, count: 2, want: []int{7, 6}},
 		{
 			name: "tie on total breaks on higher minimum", groups: b12xGroups, count: 2,
 			// Group A best pair 100+40=140 (min 40); group B best pair 70+70=140 (min 70).

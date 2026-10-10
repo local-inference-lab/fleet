@@ -165,7 +165,8 @@ var ErrInsufficient = errors.New("insufficient available GPUs")
 
 // candidate is one topology-valid GPU set under consideration.
 type candidate struct {
-	picked  []int // ascending
+	picked  []int // device order handed to Docker
+	sorted  []int // ascending copy, for deterministic tie-breaks
 	total   int   // summed MemoryFreeMiB
 	minimum int   // smallest per-GPU MemoryFreeMiB
 	groups  []int // group order used to build it, for deterministic ties
@@ -176,8 +177,14 @@ type candidate struct {
 // (count <= 4: one group; 6: a full four-GPU group plus two from another; 8:
 // every group; no topology: any GPUs) it returns the one with the most total
 // free memory, breaking ties by the larger per-GPU minimum and then by lowest
-// group order and index. The result is in ascending index order, which is how
-// it lands in the container's GPU label and in Docker's device list.
+// group order and index.
+//
+// The returned order is the device order handed to Docker and stored in the
+// container label, so it determines the rank -> GPU mapping of PCIe allreduce
+// collectives. It follows topology traversal: GPUs within a group in manifest
+// order; TP6 lists the full primary group, then the two extra GPUs; TP8
+// concatenates the groups in manifest order. Without a topology it is
+// ascending.
 func (a Allocator) Allocate(devices []Device, count int, reserved []int) ([]int, error) {
 	if count <= 0 {
 		return nil, nil
@@ -191,6 +198,7 @@ func (a Allocator) Allocate(devices []Device, count int, reserved []int) ([]int,
 		for index := range free {
 			indexes = append(indexes, index)
 		}
+		sort.Ints(indexes)
 		if picked, ok := pickMostFree(free, indexes, count); ok {
 			candidates = append(candidates, newCandidate(free, nil, picked))
 		}
@@ -255,8 +263,9 @@ func topologyCandidates(free map[int]int, groups [][]int, count int) []candidate
 	return candidates
 }
 
-// pickMostFree returns the count available indexes from pool with the most
-// free memory (lower index first on ties).
+// pickMostFree chooses the count available indexes from pool with the most
+// free memory and returns them in pool order. Ties go to the earlier pool
+// position, i.e. the group's manifest order, as first-fit placement did.
 func pickMostFree(free map[int]int, pool []int, count int) ([]int, bool) {
 	available := make([]int, 0, len(pool))
 	for _, index := range pool {
@@ -267,18 +276,25 @@ func pickMostFree(free map[int]int, pool []int, count int) ([]int, bool) {
 	if len(available) < count {
 		return nil, false
 	}
-	sort.Slice(available, func(i, j int) bool {
-		if free[available[i]] != free[available[j]] {
-			return free[available[i]] > free[available[j]]
+	ranked := append([]int(nil), available...)
+	sort.SliceStable(ranked, func(i, j int) bool { return free[ranked[i]] > free[ranked[j]] })
+	chosen := make(map[int]bool, count)
+	for _, index := range ranked[:count] {
+		chosen[index] = true
+	}
+	picked := make([]int, 0, count)
+	for _, index := range available {
+		if chosen[index] {
+			picked = append(picked, index)
 		}
-		return available[i] < available[j]
-	})
-	return append([]int(nil), available[:count]...), true
+	}
+	return picked, true
 }
 
 func newCandidate(free map[int]int, groups []int, picked []int) candidate {
-	sort.Ints(picked)
-	c := candidate{picked: picked, groups: groups}
+	sorted := append([]int(nil), picked...)
+	sort.Ints(sorted)
+	c := candidate{picked: picked, sorted: sorted, groups: groups}
 	for i, index := range picked {
 		c.total += free[index]
 		if i == 0 || free[index] < c.minimum {
@@ -298,7 +314,7 @@ func better(left, right candidate) bool {
 	if c := compareInts(left.groups, right.groups); c != 0 {
 		return c < 0
 	}
-	return compareInts(left.picked, right.picked) < 0
+	return compareInts(left.sorted, right.sorted) < 0
 }
 
 func compareInts(left, right []int) int {

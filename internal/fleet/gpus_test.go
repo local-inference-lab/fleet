@@ -56,7 +56,8 @@ func TestExplicitGPUsAssignInOrderAndSurviveRefresh(t *testing.T) {
 		labels[id] = state.AssignedGPUs
 	}
 	driver.mu.Unlock()
-	want := map[string][]int{"alpha": {1, 3}, "alpha--2": {0, 2}}
+	// The operator's order is what Docker and the labels get.
+	want := map[string][]int{"alpha": {3, 1}, "alpha--2": {2, 0}}
 	if !reflect.DeepEqual(labels, want) {
 		t.Fatalf("container GPUs = %v, want %v", labels, want)
 	}

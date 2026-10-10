@@ -135,8 +135,8 @@ func TestHandlerLoadWithExplicitGPUs(t *testing.T) {
 		t.Fatalf("cross-group pick must warn: %s", recorder.Body.String())
 	}
 	waitHandlerOperation(t, manager, accepted.Operation.ID)
-	if status, _ := manager.Status("alpha"); len(status.AssignedGPUs) != 2 || status.AssignedGPUs[0] != 0 || status.AssignedGPUs[1] != 2 {
-		t.Fatalf("assigned = %v, want [0 2]", status.AssignedGPUs)
+	if status, _ := manager.Status("alpha"); len(status.AssignedGPUs) != 2 || status.AssignedGPUs[0] != 2 || status.AssignedGPUs[1] != 0 {
+		t.Fatalf("assigned = %v, want pick order [2 0]", status.AssignedGPUs)
 	}
 
 	// A pick within one group carries no warnings key.

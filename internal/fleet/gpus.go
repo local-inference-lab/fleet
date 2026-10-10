@@ -11,7 +11,162 @@ import (
 	"time"
 
 	"github.com/local-inference-lab/fleet/internal/gpu"
+	"github.com/local-inference-lab/fleet/internal/manifest"
 )
+
+// GPU selection error codes, returned verbatim as API error codes.
+const (
+	GPUErrNotSupported  = "gpus_not_supported"
+	GPUErrNotApplicable = "gpus_not_applicable"
+	GPUErrInvalid       = "invalid_gpus"
+	GPUErrUnavailable   = "gpus_unavailable"
+)
+
+// GPUSelectionError rejects an explicit GPU list on a load request. Code is
+// one of the GPUErr* constants.
+type GPUSelectionError struct {
+	Code string
+	Err  error
+}
+
+func (e *GPUSelectionError) Error() string { return e.Err.Error() }
+func (e *GPUSelectionError) Unwrap() error { return e.Err }
+
+func gpuSelectionErrorf(code, format string, args ...any) *GPUSelectionError {
+	return &GPUSelectionError{Code: code, Err: fmt.Errorf(format, args...)}
+}
+
+// validateGPUListShape checks what needs no state: indices are non-negative
+// and unique.
+func validateGPUListShape(gpus []int) error {
+	seen := make(map[int]bool, len(gpus))
+	for _, index := range gpus {
+		if index < 0 {
+			return gpuSelectionErrorf(GPUErrInvalid, "gpus contains negative index %d", index)
+		}
+		if seen[index] {
+			return gpuSelectionErrorf(GPUErrInvalid, "gpus contains duplicate index %d", index)
+		}
+		seen[index] = true
+	}
+	return nil
+}
+
+// startIndexesLocked lists the instance indexes an activation to target would
+// start: every index up to target without a keepable instance. It mirrors the
+// keep rule in planInstancesLocked.
+func (m *Manager) startIndexesLocked(modelID string, target int) []int {
+	kept := map[int]bool{}
+	for _, instance := range m.statuses[modelID].Instances {
+		if instance.Index <= target && keepableInstance(instance) {
+			kept[instance.Index] = true
+		}
+	}
+	var starts []int
+	for index := 1; index <= target; index++ {
+		if !kept[index] {
+			starts = append(starts, index)
+		}
+	}
+	return starts
+}
+
+// checkGPUCountLocked requires an explicit GPU list to cover exactly the
+// instances this request starts.
+func (m *Manager) checkGPUCountLocked(model manifest.Model, target int, gpus []int) error {
+	starts := m.startIndexesLocked(model.ID, target)
+	if len(starts) == 0 {
+		return gpuSelectionErrorf(GPUErrNotApplicable, "gpus apply only to newly started instances, and this request starts none of %s's %d instances", model.ID, target)
+	}
+	if want := model.Placement.GPUCount * len(starts); len(gpus) != want {
+		return gpuSelectionErrorf(GPUErrInvalid, "gpus lists %d GPUs, want %d (gpu_count %d x %d new instances)", len(gpus), want, model.Placement.GPUCount, len(starts))
+	}
+	return nil
+}
+
+// validateExplicitGPUsLocked checks an operator's GPU pick against the
+// snapshot and current reservations, and splits it into one ascending GPU
+// list per started instance. Topology group rules are deliberately not
+// enforced; a pick spanning groups only produces a warning.
+func (m *Manager) validateExplicitGPUsLocked(cfg *manifest.Manifest, model manifest.Model, startIndexes []int, devices []gpu.Device, snapshotErr error, gpus []int) ([][]int, []string, error) {
+	topology := gpu.Topology{Groups: cfg.Runtime.GPUTopology.Groups, MaxUsedMemoryMiB: cfg.Runtime.GPUTopology.MaxUsedMemoryMiB}
+	byIndex := make(map[int]gpu.Device, len(devices))
+	if snapshotErr == nil {
+		for _, device := range devices {
+			byIndex[device.Index] = device
+		}
+	}
+	var unknown []int
+	for _, index := range gpus {
+		_, inSnapshot := byIndex[index]
+		_, inTopology := topology.GroupOf(index)
+		if !inSnapshot && !inTopology {
+			unknown = append(unknown, index)
+		}
+	}
+	if len(unknown) != 0 {
+		return nil, nil, gpuSelectionErrorf(GPUErrInvalid, "gpus %s are not in the GPU snapshot or the manifest topology", formatIndexes(unknown))
+	}
+	if snapshotErr != nil {
+		return nil, nil, snapshotErr
+	}
+
+	// The instances being (re)started give their old GPUs back, so a failed
+	// replica may be restarted on its own cards.
+	restarting := make(map[string]bool, len(startIndexes))
+	for _, index := range startIndexes {
+		restarting[instanceID(model.ID, index)] = true
+	}
+	holders := m.gpuHoldersLocked()
+	var busy []string
+	for _, index := range gpus {
+		for _, holder := range holders[index] {
+			if holder.ModelID == model.ID && restarting[holder.InstanceID] {
+				continue
+			}
+			busy = append(busy, fmt.Sprintf("GPU %d is assigned to %s", index, holder.InstanceID))
+			break
+		}
+		if device, ok := byIndex[index]; ok && topology.OverThreshold(device) {
+			busy = append(busy, fmt.Sprintf("GPU %d uses %d MiB, above max_used_memory_mib %d", index, device.MemoryUsedMiB, topology.MaxUsedMemoryMiB))
+		}
+	}
+	if len(busy) != 0 {
+		return nil, nil, &GPUSelectionError{Code: GPUErrUnavailable, Err: errors.New(strings.Join(busy, "; "))}
+	}
+
+	count := model.Placement.GPUCount
+	perInstance := make([][]int, len(startIndexes))
+	var warnings []string
+	for i, index := range startIndexes {
+		chunk := append([]int(nil), gpus[i*count:(i+1)*count]...)
+		sort.Ints(chunk)
+		perInstance[i] = chunk
+		if count > 4 || len(topology.Groups) == 0 {
+			continue
+		}
+		spanned := map[int]bool{}
+		for _, gpuIndex := range chunk {
+			group, ok := topology.GroupOf(gpuIndex)
+			if !ok {
+				group = -1 - gpuIndex // outside every group: its own island
+			}
+			spanned[group] = true
+		}
+		if len(spanned) > 1 {
+			warnings = append(warnings, fmt.Sprintf("instance %s GPUs %s span %d PCIe groups; tensor-parallel traffic will cross group boundaries", instanceID(model.ID, index), formatIndexes(chunk), len(spanned)))
+		}
+	}
+	return perInstance, warnings, nil
+}
+
+func formatIndexes(indexes []int) string {
+	parts := make([]string, len(indexes))
+	for i, index := range indexes {
+		parts[i] = strconv.Itoa(index)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
 
 // GPUAssignment names a Fleet deployment instance holding a GPU.
 type GPUAssignment struct {

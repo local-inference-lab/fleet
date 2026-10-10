@@ -116,9 +116,97 @@ func waitHandlerOperation(t *testing.T, manager *fleet.Manager, id string) {
 	t.Fatalf("operation %s did not succeed", id)
 }
 
+func TestHandlerLoadWithExplicitGPUs(t *testing.T) {
+	handler, manager := newPlacementTestHandler(t, &apiGPUProvider{})
+
+	recorder := serve(handler, http.MethodPost, "/v1/models/alpha/load", `{"instances":1,"gpus":[2,0]}`)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("load status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var accepted struct {
+		Changed   bool            `json:"changed"`
+		Operation fleet.Operation `json:"operation"`
+		Warnings  []string        `json:"warnings"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &accepted); err != nil {
+		t.Fatal(err)
+	}
+	if !accepted.Changed || len(accepted.Warnings) != 1 || len(accepted.Operation.Warnings) != 1 {
+		t.Fatalf("cross-group pick must warn: %s", recorder.Body.String())
+	}
+	waitHandlerOperation(t, manager, accepted.Operation.ID)
+	if status, _ := manager.Status("alpha"); len(status.AssignedGPUs) != 2 || status.AssignedGPUs[0] != 0 || status.AssignedGPUs[1] != 2 {
+		t.Fatalf("assigned = %v, want [0 2]", status.AssignedGPUs)
+	}
+
+	// A pick within one group carries no warnings key.
+	recorder = serve(handler, http.MethodPost, "/v1/models/gamma/load", `{"gpus":[1]}`)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("gamma load status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["warnings"]; ok {
+		t.Fatalf("unexpected warnings: %s", recorder.Body.String())
+	}
+}
+
+func TestHandlerLoadGPUErrors(t *testing.T) {
+	handler, manager := newPlacementTestHandler(t, &apiGPUProvider{})
+	recorder := serve(handler, http.MethodPost, "/v1/models/gamma/load", `{"gpus":[0]}`)
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("setup load = %d %s", recorder.Code, recorder.Body.String())
+	}
+	var accepted struct {
+		Operation fleet.Operation `json:"operation"`
+	}
+	_ = json.Unmarshal(recorder.Body.Bytes(), &accepted)
+	waitHandlerOperation(t, manager, accepted.Operation.ID)
+
+	for _, tc := range []struct {
+		name   string
+		path   string
+		body   string
+		status int
+		code   string
+	}{
+		{"static model", "/v1/models/beta/load", `{"gpus":[3]}`, http.StatusBadRequest, "gpus_not_supported"},
+		{"nothing to start", "/v1/models/gamma/load", `{"instances":1,"gpus":[1]}`, http.StatusBadRequest, "gpus_not_applicable"},
+		{"not an array", "/v1/models/alpha/load", `{"gpus":"0,1"}`, http.StatusBadRequest, "invalid_gpus"},
+		{"not integers", "/v1/models/alpha/load", `{"gpus":[0.5,1]}`, http.StatusBadRequest, "invalid_gpus"},
+		{"negative", "/v1/models/alpha/load", `{"gpus":[-1,1]}`, http.StatusBadRequest, "invalid_gpus"},
+		{"duplicate", "/v1/models/alpha/load", `{"gpus":[1,1]}`, http.StatusBadRequest, "invalid_gpus"},
+		{"unknown", "/v1/models/alpha/load", `{"gpus":[1,7]}`, http.StatusBadRequest, "invalid_gpus"},
+		{"wrong count", "/v1/models/alpha/load", `{"gpus":[1]}`, http.StatusBadRequest, "invalid_gpus"},
+		{"assigned elsewhere", "/v1/models/alpha/load", `{"gpus":[0,1]}`, http.StatusConflict, "gpus_unavailable"},
+		{"over memory threshold", "/v1/models/alpha/load", `{"gpus":[2,3]}`, http.StatusConflict, "gpus_unavailable"},
+		{"unknown field", "/v1/models/alpha/load", `{"gpus":[1,2],"pin":true}`, http.StatusBadRequest, "invalid_request"},
+		{"null gpus alone", "/v1/models/alpha/load", `{"gpus":null}`, http.StatusBadRequest, "invalid_request"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := serve(handler, http.MethodPost, tc.path, tc.body)
+			if recorder.Code != tc.status {
+				t.Fatalf("status = %d, want %d; body = %s", recorder.Code, tc.status, recorder.Body.String())
+			}
+			if code := errorCode(t, recorder); code != tc.code {
+				t.Fatalf("code = %q, want %q", code, tc.code)
+			}
+		})
+	}
+
+	// An empty list means automatic placement, which finds no free TP2 pair
+	// (GPU 0 is gamma's, GPU 3 is over the threshold).
+	recorder = serve(handler, http.MethodPost, "/v1/models/alpha/load", `{"instances":1,"gpus":[]}`)
+	if recorder.Code != http.StatusConflict || errorCode(t, recorder) != "insufficient_resources" {
+		t.Fatalf("empty gpus load = %d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestHandlerGPUInventory(t *testing.T) {
 	handler, manager := newPlacementTestHandler(t, &apiGPUProvider{})
-	recorder := serve(handler, http.MethodPost, "/v1/models/alpha/load", `{"instances":1}`)
+	recorder := serve(handler, http.MethodPost, "/v1/models/alpha/load", `{"gpus":[0,1]}`)
 	var accepted struct {
 		Operation fleet.Operation `json:"operation"`
 	}

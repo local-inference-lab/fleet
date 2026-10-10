@@ -106,13 +106,32 @@ Load a model. By default this is an exclusive switch. When `runtime.concurrent_d
 curl -i -X POST http://127.0.0.1:8090/v1/models/qwen3-8b/load
 ```
 
-To request an exact replica count, send a strict JSON body with only `instances`. The value must be between 1 and 64 and must fit the manifest's GPU topology and dynamic port pool. For example, a TP4 profile on the B12X manifest can run as two disjoint four-GPU instances:
+To request an exact replica count, send a strict JSON body with `instances` (and optionally `gpus`, below); other fields are rejected. The value must be between 1 and 64 and must fit the manifest's GPU topology and dynamic port pool. For example, a TP4 profile on the B12X manifest can run as two disjoint four-GPU instances:
 
 ```sh
 curl -i -X POST http://127.0.0.1:8090/v1/models/qwen38-flash-next-qad4000-tp4/load \
   -H 'content-type: application/json' \
   -d '{"instances":2}'
 ```
+
+For a model with `placement`, a load may also choose the GPUs for the instances it starts with `gpus`. The list must hold `placement.gpu_count` indices per newly started instance; the first `gpu_count` go to the first new instance, and so on (each instance's GPUs are stored in ascending order and persist in the container labels like automatic picks). Omitting `gpus`, or sending `[]`, keeps automatic placement. Fleet does not enforce PCIe group rules for an explicit pick; a pick that spans groups for a TP1 to TP4 model succeeds with a `warnings` array in the response:
+
+```sh
+curl -i -X POST http://127.0.0.1:8090/v1/models/qwen38-flash-next-tp2-ssd/load \
+  -H 'content-type: application/json' \
+  -d '{"instances":1,"gpus":[2,3]}'
+```
+
+```json
+{"changed": true, "operation": {"id": "…", "kind": "activate", "model_id": "qwen38-flash-next-tp2-ssd", "instances": 1, "gpus": [2,3], "state": "pending", "created_at": "…"}}
+```
+
+| Status | Code | Cause |
+|-|-|-|
+| 400 | `gpus_not_supported` | The model has no `placement` |
+| 400 | `gpus_not_applicable` | `gpus` is non-empty but the request starts no new instance (count unchanged or lower) |
+| 400 | `invalid_gpus` | Not an integer array, a negative, duplicate, or unknown index (in neither `nvidia-smi` nor the topology), or the length is not `gpu_count` times the new instances |
+| 409 | `gpus_unavailable` | A GPU is assigned to another deployment or instance (including one still loading) or is above `max_used_memory_mib` |
 
 The response is `202 Accepted`, includes an operation whose `instances` field is the target count, and sets a `Location` header. Poll that operation and the deployment:
 
@@ -135,7 +154,7 @@ Unload a model:
 curl -i -X POST http://127.0.0.1:8090/v1/models/mistral-7b/unload
 ```
 
-Unload stops all instances of that profile. Lifecycle calls are idempotent per model: a duplicate in-flight call (same kind and, for loads, the same `instances`) returns the same operation, and a conflicting call for that model returns `409 Conflict`. Without `runtime.concurrent_deployments`, switching is exclusive, so any lifecycle call during a running operation returns `409`. With it, each model has its own operation: a model waiting up to `readiness_timeout` for readiness does not block loads or unloads of other models. Container stop/create/start steps are still serialized fleet-wide by a short lock, so two GPU-heavy profiles never start at the same instant, and GPUs are reserved under the manager lock before any container is created.
+Unload stops all instances of that profile. Lifecycle calls are idempotent per model: a duplicate in-flight call (same kind and, for loads, the same `instances` and either no `gpus` or the same `gpus`) returns the same operation, and a conflicting call for that model returns `409 Conflict`. Without `runtime.concurrent_deployments`, switching is exclusive, so any lifecycle call during a running operation returns `409`. With it, each model has its own operation: a model waiting up to `readiness_timeout` for readiness does not block loads or unloads of other models. Container stop/create/start steps are still serialized fleet-wide by a short lock, so two GPU-heavy profiles never start at the same instant, and GPUs are reserved under the manager lock before any container is created.
 
 Note that an empty load body and `{"instances":1}` differ when a model already runs replicas: the empty body keeps the current replica count, while `{"instances":1}` scales down to one.
 

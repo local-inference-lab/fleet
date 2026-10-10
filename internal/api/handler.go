@@ -143,11 +143,11 @@ func (h *Handler) handleSwitch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleActivate(w http.ResponseWriter, r *http.Request, id string) {
-	instances, ok := decodeLoadRequest(w, r)
+	request, ok := decodeLoadRequest(w, r)
 	if !ok {
 		return
 	}
-	op, noOp, err := h.manager.ActivateInstances(id, instances)
+	op, noOp, err := h.manager.Load(id, request)
 	h.writeLifecycleResult(w, op, noOp, err)
 }
 
@@ -178,6 +178,15 @@ func (h *Handler) writeLifecycleResult(w http.ResponseWriter, op fleet.Operation
 			writeError(w, http.StatusConflict, "insufficient_resources", err.Error(), nil)
 			return
 		}
+		var selection *fleet.GPUSelectionError
+		if errors.As(err, &selection) {
+			status := http.StatusBadRequest
+			if selection.Code == fleet.GPUErrUnavailable {
+				status = http.StatusConflict
+			}
+			writeError(w, status, selection.Code, err.Error(), nil)
+			return
+		}
 		var invalid *fleet.InvalidRequestError
 		if errors.As(err, &invalid) {
 			writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
@@ -195,46 +204,64 @@ func (h *Handler) writeLifecycleResult(w http.ResponseWriter, op fleet.Operation
 		status = http.StatusAccepted
 	}
 	w.Header().Set("Location", "/v1/operations/"+op.ID)
-	writeJSON(w, status, map[string]any{"changed": !noOp, "operation": op})
+	response := map[string]any{"changed": !noOp, "operation": op}
+	if len(op.Warnings) != 0 {
+		response["warnings"] = op.Warnings
+	}
+	writeJSON(w, status, response)
 }
 
-func decodeLoadRequest(w http.ResponseWriter, r *http.Request) (*int, bool) {
+func decodeLoadRequest(w http.ResponseWriter, r *http.Request) (fleet.LoadRequest, bool) {
 	defer r.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error(), nil)
-		return nil, false
+		return fleet.LoadRequest{}, false
 	}
 	if len(strings.TrimSpace(string(body))) == 0 {
-		return nil, true
+		return fleet.LoadRequest{}, true
 	}
 	var request struct {
 		Instances *int `json:"instances"`
+		// GPUs is decoded separately so a malformed list reports invalid_gpus.
+		GPUs json.RawMessage `json:"gpus"`
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(body)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("decode JSON: %w", err).Error(), nil)
-		return nil, false
+		return fleet.LoadRequest{}, false
 	}
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		if err == nil {
 			writeError(w, http.StatusBadRequest, "invalid_request", "request must contain exactly one JSON object", nil)
-			return nil, false
+			return fleet.LoadRequest{}, false
 		}
 		writeError(w, http.StatusBadRequest, "invalid_request", fmt.Errorf("decode trailing JSON: %w", err).Error(), nil)
-		return nil, false
+		return fleet.LoadRequest{}, false
 	}
-	if request.Instances == nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "instances is required when a load request body is provided", nil)
-		return nil, false
+	var gpus []int
+	hasGPUs := len(request.GPUs) != 0 && string(request.GPUs) != "null"
+	if hasGPUs {
+		if err := json.Unmarshal(request.GPUs, &gpus); err != nil {
+			writeError(w, http.StatusBadRequest, fleet.GPUErrInvalid, "gpus must be an array of non-negative integer GPU indices", nil)
+			return fleet.LoadRequest{}, false
+		}
+		if len(gpus) > 1024 {
+			writeError(w, http.StatusBadRequest, fleet.GPUErrInvalid, "gpus lists too many GPUs", nil)
+			return fleet.LoadRequest{}, false
+		}
 	}
-	if *request.Instances < 1 || *request.Instances > 64 {
+	if request.Instances == nil && !hasGPUs {
+		writeError(w, http.StatusBadRequest, "invalid_request", "instances or gpus is required when a load request body is provided", nil)
+		return fleet.LoadRequest{}, false
+	}
+	if request.Instances != nil && (*request.Instances < 1 || *request.Instances > 64) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "instances must be between 1 and 64", nil)
-		return nil, false
+		return fleet.LoadRequest{}, false
 	}
-	return request.Instances, true
+	return fleet.LoadRequest{Instances: request.Instances, GPUs: gpus}, true
 }
 
 func (h *Handler) handleOperation(w http.ResponseWriter, id string) {

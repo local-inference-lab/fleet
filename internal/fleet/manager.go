@@ -150,6 +150,10 @@ type Manager struct {
 	// before the (potentially very long) readiness wait.
 	lifecycleMu sync.Mutex
 
+	// gpuCache holds the last nvidia-smi snapshot for the inventory API. It
+	// has its own lock so a slow nvidia-smi never touches mu.
+	gpuCache gpuSnapshotCache
+
 	cancel context.CancelFunc
 	done   chan struct{}
 }
@@ -209,7 +213,7 @@ func (m *Manager) Models() []ModelInfo {
 	defer m.mu.RUnlock()
 	models := make([]ModelInfo, 0, len(m.manifest.Models))
 	for _, model := range m.manifest.Models {
-		gpuCount := 0
+		gpuCount := staticGPUCount(model.GPUs, m.manifest.Runtime.GPUTopology.Groups)
 		if model.Placement != nil {
 			gpuCount = model.Placement.GPUCount
 		}
@@ -453,6 +457,7 @@ func (m *Manager) tryActivate(modelID string, requested *int) (Operation, bool, 
 		ctx, cancel := context.WithTimeout(context.Background(), gpuSnapshotTimeout)
 		devices, snapshotErr = m.gpus.Snapshot(ctx)
 		cancel()
+		m.gpuCache.store(devices, snapshotErr, m.now())
 	}
 
 	m.mu.Lock()

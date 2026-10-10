@@ -11,10 +11,16 @@ import (
 	"time"
 )
 
+// Device is one GPU from an nvidia-smi snapshot. Index, MemoryUsedMiB and
+// MemoryFreeMiB are all the allocator needs; the rest feeds the inventory API.
 type Device struct {
-	Index         int
-	MemoryUsedMiB int
-	MemoryFreeMiB int
+	Index          int
+	Name           string
+	MemoryTotalMiB int
+	MemoryUsedMiB  int
+	MemoryFreeMiB  int
+	// UtilizationPercent is nil when nvidia-smi reports it as unavailable.
+	UtilizationPercent *int
 }
 
 type Provider interface {
@@ -36,6 +42,9 @@ func NewNVIDIAProvider(binary string) NVIDIAProvider {
 // wedged driver otherwise hangs the query indefinitely.
 const DefaultSnapshotTimeout = 10 * time.Second
 
+// QueryFields is the nvidia-smi --query-gpu column list ParseNVIDIASMI expects.
+const QueryFields = "index,name,memory.total,memory.used,memory.free,utilization.gpu"
+
 func (p NVIDIAProvider) Snapshot(ctx context.Context) ([]Device, error) {
 	if _, ok := ctx.Deadline(); !ok {
 		var cancel context.CancelFunc
@@ -43,7 +52,7 @@ func (p NVIDIAProvider) Snapshot(ctx context.Context) ([]Device, error) {
 		defer cancel()
 	}
 	out, err := exec.CommandContext(ctx, p.Binary,
-		"--query-gpu=index,memory.used,memory.free",
+		"--query-gpu="+QueryFields,
 		"--format=csv,noheader,nounits",
 	).Output()
 	if err != nil {
@@ -52,6 +61,10 @@ func (p NVIDIAProvider) Snapshot(ctx context.Context) ([]Device, error) {
 	return ParseNVIDIASMI(string(out))
 }
 
+// ParseNVIDIASMI parses `--query-gpu=` QueryFields CSV output. The legacy
+// three-column `index,memory.used,memory.free` form is still accepted. GPU
+// names may contain spaces (and, defensively, commas): the name is everything
+// between the first column and the last four.
 func ParseNVIDIASMI(raw string) ([]Device, error) {
 	var devices []Device
 	for lineNo, line := range strings.Split(raw, "\n") {
@@ -60,29 +73,83 @@ func ParseNVIDIASMI(raw string) ([]Device, error) {
 			continue
 		}
 		parts := strings.Split(line, ",")
-		if len(parts) != 3 {
-			return nil, fmt.Errorf("parse nvidia-smi line %d: expected 3 columns", lineNo+1)
-		}
-		index, err := atoiColumn(parts[0])
+		device, err := parseDeviceLine(parts)
 		if err != nil {
-			return nil, fmt.Errorf("parse nvidia-smi line %d index: %w", lineNo+1, err)
+			return nil, fmt.Errorf("parse nvidia-smi line %d: %w", lineNo+1, err)
 		}
-		used, err := atoiColumn(parts[1])
-		if err != nil {
-			return nil, fmt.Errorf("parse nvidia-smi line %d memory.used: %w", lineNo+1, err)
-		}
-		free, err := atoiColumn(parts[2])
-		if err != nil {
-			return nil, fmt.Errorf("parse nvidia-smi line %d memory.free: %w", lineNo+1, err)
-		}
-		devices = append(devices, Device{Index: index, MemoryUsedMiB: used, MemoryFreeMiB: free})
+		devices = append(devices, device)
 	}
 	sort.Slice(devices, func(i, j int) bool { return devices[i].Index < devices[j].Index })
 	return devices, nil
 }
 
-func atoiColumn(value string) (int, error) {
-	return strconv.Atoi(strings.TrimSpace(value))
+func parseDeviceLine(parts []string) (Device, error) {
+	var device Device
+	var err error
+	if len(parts) == 3 {
+		if device.Index, err = atoiColumn("index", parts[0]); err != nil {
+			return Device{}, err
+		}
+		if device.MemoryUsedMiB, err = atoiColumn("memory.used", parts[1]); err != nil {
+			return Device{}, err
+		}
+		if device.MemoryFreeMiB, err = atoiColumn("memory.free", parts[2]); err != nil {
+			return Device{}, err
+		}
+		return device, nil
+	}
+	if len(parts) < 6 {
+		return Device{}, fmt.Errorf("expected 6 columns, got %d", len(parts))
+	}
+	tail := parts[len(parts)-4:]
+	if device.Index, err = atoiColumn("index", parts[0]); err != nil {
+		return Device{}, err
+	}
+	device.Name = strings.TrimSpace(strings.Join(parts[1:len(parts)-4], ","))
+	if device.MemoryTotalMiB, err = atoiColumn("memory.total", tail[0]); err != nil {
+		return Device{}, err
+	}
+	if device.MemoryUsedMiB, err = atoiColumn("memory.used", tail[1]); err != nil {
+		return Device{}, err
+	}
+	if device.MemoryFreeMiB, err = atoiColumn("memory.free", tail[2]); err != nil {
+		return Device{}, err
+	}
+	if value := strings.TrimSpace(tail[3]); !unavailableValue(value) {
+		utilization, err := atoiColumn("utilization.gpu", value)
+		if err != nil {
+			return Device{}, err
+		}
+		device.UtilizationPercent = &utilization
+	}
+	return device, nil
+}
+
+// unavailableValue recognizes nvidia-smi placeholders such as "[N/A]" and
+// "[Not Supported]" (some drivers omit the brackets).
+func unavailableValue(value string) bool {
+	if value == "" {
+		return true
+	}
+	if strings.HasPrefix(value, "[") && strings.HasSuffix(value, "]") {
+		return true
+	}
+	switch strings.ToLower(value) {
+	case "n/a", "not supported", "unknown error":
+		return true
+	}
+	return false
+}
+
+func atoiColumn(name, value string) (int, error) {
+	parsed, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid value %q", name, strings.TrimSpace(value))
+	}
+	if parsed < 0 {
+		return 0, fmt.Errorf("%s: negative value %d", name, parsed)
+	}
+	return parsed, nil
 }
 
 type Topology struct {

@@ -3,17 +3,56 @@ package gpu
 import (
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 )
 
+func intPtr(value int) *int { return &value }
+
 func TestParseNVIDIASMI(t *testing.T) {
-	devices, err := ParseNVIDIASMI("0, 10, 97800\n1, 0, 97810\n")
+	raw := "1, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887, 1234, 96000, 37\n" +
+		"0, NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887, 10, 97800, [N/A]\n" +
+		"\n"
+	devices, err := ParseNVIDIASMI(raw)
 	if err != nil {
 		t.Fatalf("ParseNVIDIASMI() error = %v", err)
 	}
-	want := []Device{{Index: 0, MemoryUsedMiB: 10, MemoryFreeMiB: 97800}, {Index: 1, MemoryUsedMiB: 0, MemoryFreeMiB: 97810}}
+	want := []Device{
+		{Index: 0, Name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", MemoryTotalMiB: 97887, MemoryUsedMiB: 10, MemoryFreeMiB: 97800},
+		{Index: 1, Name: "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", MemoryTotalMiB: 97887, MemoryUsedMiB: 1234, MemoryFreeMiB: 96000, UtilizationPercent: intPtr(37)},
+	}
 	if !reflect.DeepEqual(devices, want) {
 		t.Fatalf("devices = %+v, want %+v", devices, want)
+	}
+}
+
+func TestParseNVIDIASMIRobustness(t *testing.T) {
+	devices, err := ParseNVIDIASMI("0, Weird, Name, With Commas, 100, 40, 60, [Not Supported]\n")
+	if err != nil {
+		t.Fatalf("comma name error = %v", err)
+	}
+	if devices[0].Name != "Weird, Name, With Commas" || devices[0].MemoryFreeMiB != 60 || devices[0].UtilizationPercent != nil {
+		t.Fatalf("comma name parsed as %+v", devices[0])
+	}
+
+	legacy, err := ParseNVIDIASMI("0, 10, 97800\n1, 0, 97810\n")
+	if err != nil {
+		t.Fatalf("legacy error = %v", err)
+	}
+	if want := []Device{{Index: 0, MemoryUsedMiB: 10, MemoryFreeMiB: 97800}, {Index: 1, MemoryUsedMiB: 0, MemoryFreeMiB: 97810}}; !reflect.DeepEqual(legacy, want) {
+		t.Fatalf("legacy = %+v, want %+v", legacy, want)
+	}
+
+	for _, bad := range []string{
+		"0, GPU, 100, [N/A], 60, 1", // memory is never optional
+		"0, GPU, 100, 40, 60",       // too few columns
+		"x, GPU, 100, 40, 60, 1",    // bad index
+		"0, GPU, 100, 40, 60, lots", // bad utilization
+		"-1, GPU, 100, 40, 60, 1",   // negative index
+	} {
+		if _, err := ParseNVIDIASMI(bad); err == nil {
+			t.Fatalf("ParseNVIDIASMI(%q) succeeded", bad)
+		}
 	}
 }
 
@@ -150,5 +189,8 @@ func TestTopologyHelpers(t *testing.T) {
 	}
 	if (Topology{}).OverThreshold(Device{MemoryUsedMiB: 1 << 20}) {
 		t.Fatal("zero threshold must not exclude GPUs")
+	}
+	if !strings.Contains(QueryFields, "utilization.gpu") {
+		t.Fatal("QueryFields misses utilization")
 	}
 }

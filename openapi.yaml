@@ -36,6 +36,21 @@ paths:
                   models:
                     type: array
                     items: {$ref: "#/components/schemas/ModelWithStatus"}
+  /v1/gpus:
+    get:
+      operationId: listGPUs
+      description: >-
+        GPU inventory from nvidia-smi joined with the manifest topology and Fleet's current GPU
+        assignments. The snapshot is cached for about 5 seconds and refreshed by at most one
+        nvidia-smi run at a time (5 s timeout). If nvidia-smi fails, the last snapshot is served
+        with stale=true while it is under 60 seconds old; otherwise the endpoint returns 503.
+      responses:
+        "200":
+          description: GPU inventory
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GPUInventory"}
+        "503": {description: nvidia-smi failed and no recent snapshot exists (code gpu_query_failed), content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
   /v1/models/{modelId}:
     parameters:
       - $ref: "#/components/parameters/ModelId"
@@ -174,7 +189,7 @@ components:
         id: {type: string}
         description: {type: string}
         image: {type: string}
-        gpu_count: {type: integer, minimum: 0, description: Number of GPUs required by one instance when topology placement is configured}
+        gpu_count: {type: integer, minimum: 1, description: "GPUs used by one instance: placement.gpu_count, or the count implied by a static gpus value (for example device=0,1). Omitted when the model uses no GPUs or the count is unknown."}
         max_instances: {type: integer, minimum: 1, description: Maximum instances that can fit the configured topology and dynamic port pool}
     LoadRequest:
       type: object
@@ -186,6 +201,39 @@ components:
           minimum: 1
           maximum: 64
           description: Exact desired instance count for this profile. Omit the request body entirely for legacy ensure-loaded behavior.
+    GPUInventory:
+      type: object
+      required: [sampled_at, groups, gpus]
+      properties:
+        sampled_at: {type: string, format: date-time, description: When the nvidia-smi snapshot was taken.}
+        stale: {type: boolean, description: Present and true when nvidia-smi failed and the last good snapshot (under 60 s old) is served.}
+        groups:
+          type: array
+          description: Manifest PCIe topology groups; empty when none is configured.
+          items: {type: array, items: {type: integer, minimum: 0}}
+        gpus:
+          type: array
+          items: {$ref: "#/components/schemas/GPU"}
+    GPU:
+      type: object
+      required: [index, name, memory_total_mib, memory_used_mib, memory_free_mib, utilization_percent, group, assigned]
+      properties:
+        index: {type: integer, minimum: 0}
+        name: {type: string}
+        memory_total_mib: {type: integer, minimum: 0}
+        memory_used_mib: {type: integer, minimum: 0}
+        memory_free_mib: {type: integer, minimum: 0}
+        utilization_percent: {type: [integer, "null"], minimum: 0, maximum: 100, description: Null when nvidia-smi reports it unavailable.}
+        group: {type: [integer, "null"], minimum: 0, description: Index into groups, or null when the GPU is in no group.}
+        assigned:
+          type: array
+          description: Fleet deployment instances holding this GPU, including ones still loading or stopping; empty when free.
+          items:
+            type: object
+            required: [model_id, instance_id]
+            properties:
+              model_id: {type: string}
+              instance_id: {type: string}
     ModelWithStatus:
       type: object
       required: [model, status]

@@ -82,19 +82,56 @@ List the configured profiles and their current state:
 curl http://127.0.0.1:8090/v1/models
 ```
 
+Inspect the GPUs, their free memory, PCIe group, and which Fleet deployments hold them:
+
+```sh
+curl http://127.0.0.1:8090/v1/gpus
+```
+
+```json
+{
+  "sampled_at": "2026-10-10T12:00:00Z",
+  "groups": [[0,1,6,7],[2,3,4,5]],
+  "gpus": [
+    {"index": 0, "name": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition", "memory_total_mib": 97887, "memory_used_mib": 1234, "memory_free_mib": 96000, "utilization_percent": 0, "group": 0, "assigned": [{"model_id": "ds41-flash-tp4-ssd", "instance_id": "ds41-flash-tp4-ssd"}]}
+  ]
+}
+```
+
+`groups` is the manifest topology (`[]` without one) and `group` indexes into it (`null` for a GPU outside every group). `utilization_percent` is `null` when `nvidia-smi` reports it unavailable. `assigned` lists every Fleet instance holding the GPU, including loading and stopping ones, and is `[]` for a free GPU. The snapshot is reused for about 5 seconds, and concurrent requests share one `nvidia-smi` run, so polling this endpoint does not spawn a process per request. When `nvidia-smi` fails, the last snapshot is returned with `"stale": true` while it is under a minute old; otherwise the response is `503` with code `gpu_query_failed`. Each `/v1/models` entry also reports `gpu_count`: the placement GPU count, or the count implied by a static `gpus` value.
+
 Load a model. By default this is an exclusive switch. When `runtime.concurrent_deployments` is enabled, Fleet allocates free GPUs from the manifest topology and keeps compatible deployments resident. An empty request body keeps the legacy behavior: ensure at least one instance is running, or preserve the current replica count when the model is already scaled above one.
 
 ```sh
 curl -i -X POST http://127.0.0.1:8090/v1/models/qwen3-8b/load
 ```
 
-To request an exact replica count, send a strict JSON body with only `instances`. The value must be between 1 and 64 and must fit the manifest's GPU topology and dynamic port pool. For example, a TP4 profile on the B12X manifest can run as two disjoint four-GPU instances:
+To request an exact replica count, send a strict JSON body with `instances` (and optionally `gpus`, below); other fields are rejected. The value must be between 1 and 64 and must fit the manifest's GPU topology and dynamic port pool. For example, a TP4 profile on the B12X manifest can run as two disjoint four-GPU instances:
 
 ```sh
 curl -i -X POST http://127.0.0.1:8090/v1/models/qwen38-flash-next-qad4000-tp4/load \
   -H 'content-type: application/json' \
   -d '{"instances":2}'
 ```
+
+For a model with `placement`, a load may also choose the GPUs for the instances it starts with `gpus`. The list must hold `placement.gpu_count` indices per newly started instance; the first `gpu_count` go to the first new instance, and so on (each instance keeps the operator's order, which becomes the Docker device order and rank mapping, and persists in the container labels like automatic picks). Omitting `gpus`, or sending `[]`, keeps automatic placement. Fleet does not enforce PCIe group rules for an explicit pick; a pick that spans groups for a TP1 to TP4 model succeeds with a `warnings` array in the response:
+
+```sh
+curl -i -X POST http://127.0.0.1:8090/v1/models/qwen38-flash-next-tp2-ssd/load \
+  -H 'content-type: application/json' \
+  -d '{"instances":1,"gpus":[2,3]}'
+```
+
+```json
+{"changed": true, "operation": {"id": "…", "kind": "activate", "model_id": "qwen38-flash-next-tp2-ssd", "instances": 1, "gpus": [2,3], "state": "pending", "created_at": "…"}}
+```
+
+| Status | Code | Cause |
+|-|-|-|
+| 400 | `gpus_not_supported` | The model has no `placement` |
+| 400 | `gpus_not_applicable` | `gpus` is non-empty but the request starts no new instance (count unchanged or lower) |
+| 400 | `invalid_gpus` | Not an integer array, a negative, duplicate, or unknown index (in neither `nvidia-smi` nor the topology), or the length is not `gpu_count` times the new instances |
+| 409 | `gpus_unavailable` | A GPU is assigned to another deployment or instance (including one still loading) or is above `max_used_memory_mib` |
 
 The response is `202 Accepted`, includes an operation whose `instances` field is the target count, and sets a `Location` header. Poll that operation and the deployment:
 
@@ -117,7 +154,7 @@ Unload a model:
 curl -i -X POST http://127.0.0.1:8090/v1/models/mistral-7b/unload
 ```
 
-Unload stops all instances of that profile. Lifecycle calls are idempotent per model: a duplicate in-flight call (same kind and, for loads, the same `instances`) returns the same operation, and a conflicting call for that model returns `409 Conflict`. Without `runtime.concurrent_deployments`, switching is exclusive, so any lifecycle call during a running operation returns `409`. With it, each model has its own operation: a model waiting up to `readiness_timeout` for readiness does not block loads or unloads of other models. Container stop/create/start steps are still serialized fleet-wide by a short lock, so two GPU-heavy profiles never start at the same instant, and GPUs are reserved under the manager lock before any container is created.
+Unload stops all instances of that profile. Lifecycle calls are idempotent per model: a duplicate in-flight call (same kind and, for loads, the same `instances` and either no `gpus` or the same `gpus`) returns the same operation, and a conflicting call for that model returns `409 Conflict`. Without `runtime.concurrent_deployments`, switching is exclusive, so any lifecycle call during a running operation returns `409`. With it, each model has its own operation: a model waiting up to `readiness_timeout` for readiness does not block loads or unloads of other models. Container stop/create/start steps are still serialized fleet-wide by a short lock, so two GPU-heavy profiles never start at the same instant, and GPUs are reserved under the manager lock before any container is created.
 
 Note that an empty load body and `{"instances":1}` differ when a model already runs replicas: the empty body keeps the current replica count, while `{"instances":1}` scales down to one.
 
@@ -140,7 +177,7 @@ go run ./cmd/lil-fleet -manifest fleet.json -token-file .secrets/api-token
 
 The MiMo Opus55 profiles use the published `madeby561/vllm:mimo-v26-flash-b12x-20260923-rc4` image. For hosts that need the mixed-device tuning override, optionally build `Dockerfile.mimo-b12x-override` with `docker build -f Dockerfile.mimo-b12x-override -t lil-fleet/mimo-v26-flash-opus55:20260923c-b12x-mixed-device .`, then set the relevant profiles' `image` fields in `fleet.json` to that local tag.
 
-TP1 through TP4 stay within one PCIe group; TP6 takes one complete group plus two GPUs from the other; TP8 requires all GPUs. Replica loads reserve disjoint GPU sets and distinct ports from the shared `8101` through `8121` pool before creating containers, so `{"instances":2}` works for TP4 when both four-GPU groups are free. Live `nvidia-smi` memory use prevents Fleet from allocating GPUs occupied by workloads it did not create. A placement that cannot fit returns `409 Conflict` without creating a container.
+TP1 through TP4 stay within one PCIe group; TP6 takes one complete group plus two GPUs from the other; TP8 requires all GPUs. Among the placements those rules allow, Fleet picks the GPU set with the most total free memory in the latest `nvidia-smi` snapshot (ties go to the larger per-GPU minimum, then to the lowest group and index), so a TP2 load lands on the emptiest cards rather than the first free ones. The assigned list is the device order passed to Docker, so it fixes the rank-to-GPU mapping: GPUs within a group follow the manifest group order, TP6 lists the full primary group and then the two extra GPUs, and TP8 concatenates the groups in manifest order. Replica loads reserve disjoint GPU sets and distinct ports from the shared `8101` through `8121` pool before creating containers, so `{"instances":2}` works for TP4 when both four-GPU groups are free. Live `nvidia-smi` memory use prevents Fleet from allocating GPUs occupied by workloads it did not create. A placement that cannot fit returns `409 Conflict` without creating a container.
 
 The DeepSeek profile bounds host startup memory with one B12X compiler per TP rank, a 64-entry compiled-object memory cache, and 40 GiB RAM with no swap per replica. Its [startup wrapper](overrides/lil-serve-b12x-preparation-bound.sh) applies a checked, idempotent [B12X preparation patch](overrides/apply_b12x_preparation_bound.py) before the requested Karmic image's launcher: `LIL_B12X_PREPARATION_FACTORY_CACHE=0` releases discarded factory results and `LIL_B12X_PREPARATION_RACE_BATCH=2` limits concurrent tuning candidates. Autotuning stays enabled; kernel artifacts remain under the mounted SSD cache. The patch checks the image's source before writing; revalidate it when upgrading the image. Run its GPU-free tests inside the image with `python overrides/test_b12x_preparation_bound.py --source-root /opt/venv/lib/python3.12/site-packages/b12x -v`.
 

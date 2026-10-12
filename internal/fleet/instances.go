@@ -13,10 +13,11 @@ import (
 const maxRequestedInstances = 64
 
 type instancePlan struct {
-	target int
-	start  []plannedInstance
-	stop   []plannedInstance
-	keep   []InstanceStatus
+	target   int
+	warnings []string
+	start    []plannedInstance
+	stop     []plannedInstance
+	keep     []InstanceStatus
 }
 
 type plannedInstance struct {

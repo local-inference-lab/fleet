@@ -343,6 +343,10 @@ func TestLifecycleErrorsMapToClientStatusCodes(t *testing.T) {
 		{&fleet.InvalidRequestError{Err: errors.New("instances must be between 1 and 64")}, http.StatusBadRequest},
 		{&fleet.InsufficientResourcesError{ModelID: "alpha", Err: errors.New("no GPUs")}, http.StatusConflict},
 		{&fleet.ConflictError{}, http.StatusConflict},
+		{&fleet.GPUSelectionError{Code: fleet.GPUErrInvalid, Err: errors.New("duplicate")}, http.StatusBadRequest},
+		{&fleet.GPUSelectionError{Code: fleet.GPUErrNotSupported, Err: errors.New("no placement")}, http.StatusBadRequest},
+		{&fleet.GPUSelectionError{Code: fleet.GPUErrNotApplicable, Err: errors.New("nothing to start")}, http.StatusBadRequest},
+		{&fleet.GPUSelectionError{Code: fleet.GPUErrUnavailable, Err: errors.New("busy")}, http.StatusConflict},
 		{errors.New(`unknown model "x"`), http.StatusNotFound},
 	} {
 		recorder := httptest.NewRecorder()

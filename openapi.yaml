@@ -36,6 +36,21 @@ paths:
                   models:
                     type: array
                     items: {$ref: "#/components/schemas/ModelWithStatus"}
+  /v1/gpus:
+    get:
+      operationId: listGPUs
+      description: >-
+        GPU inventory from nvidia-smi joined with the manifest topology and Fleet's current GPU
+        assignments. The snapshot is cached for about 5 seconds and refreshed by at most one
+        nvidia-smi run at a time (5 s timeout). If nvidia-smi fails, the last snapshot is served
+        with stale=true while it is under 60 seconds old; otherwise the endpoint returns 503.
+      responses:
+        "200":
+          description: GPU inventory
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/GPUInventory"}
+        "503": {description: nvidia-smi failed and no recent snapshot exists (code gpu_query_failed), content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
   /v1/models/{modelId}:
     parameters:
       - $ref: "#/components/parameters/ModelId"
@@ -54,7 +69,11 @@ paths:
         larger current replica count). A JSON body with instances requests an exact target replica
         count, so {"instances":1} scales a replicated model down to one. Fleet reserves disjoint
         manifest-approved GPUs and ports before creating new containers. A request above
-        max_instances returns 409 insufficient_resources.
+        max_instances returns 409 insufficient_resources. Without gpus, each new instance is placed
+        on the topology-valid GPU set with the most free memory. With gpus, the instances this
+        request starts are pinned to the listed GPUs, gpu_count at a time in list order; topology
+        group rules are not enforced, but a pick spanning PCIe groups (gpu_count <= 4) returns
+        warnings.
       requestBody:
         required: false
         content:
@@ -63,9 +82,20 @@ paths:
       responses:
         "200": {description: Model was already ready}
         "202": {$ref: "#/components/responses/OperationAccepted"}
-        "400": {description: Invalid body or instance count (code invalid_request), content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
+        "400":
+          description: >-
+            Invalid body or instance count (code invalid_request); gpus on a model without
+            placement (gpus_not_supported); gpus when the request starts no new instance
+            (gpus_not_applicable); a malformed, negative, duplicate or unknown GPU index, or a
+            count other than gpu_count x new instances (invalid_gpus).
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
         "404": {$ref: "#/components/responses/NotFound"}
-        "409": {$ref: "#/components/responses/Conflict"}
+        "409":
+          description: >-
+            Codes operation_in_progress and insufficient_resources as for other lifecycle calls,
+            or gpus_unavailable when a requested GPU is assigned to another deployment or instance
+            (including one still loading) or uses more than runtime.gpu_topology.max_used_memory_mib.
+          content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
   /v1/models/{modelId}/unload:
     parameters:
       - $ref: "#/components/parameters/ModelId"
@@ -157,6 +187,10 @@ components:
             properties:
               changed: {type: boolean}
               operation: {$ref: "#/components/schemas/Operation"}
+              warnings:
+                type: array
+                items: {type: string}
+                description: Non-fatal notes about an explicit gpus selection, such as a pick spanning PCIe groups. Omitted when empty.
     NotFound:
       description: Model or operation not found
       content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}
@@ -174,18 +208,61 @@ components:
         id: {type: string}
         description: {type: string}
         image: {type: string}
-        gpu_count: {type: integer, minimum: 0, description: Number of GPUs required by one instance when topology placement is configured}
+        gpu_count: {type: integer, minimum: 1, description: "GPUs used by one instance: placement.gpu_count, or the count implied by a static gpus value (for example device=0,1). Omitted when the model uses no GPUs or the count is unknown."}
         max_instances: {type: integer, minimum: 1, description: Maximum instances that can fit the configured topology and dynamic port pool}
     LoadRequest:
       type: object
       additionalProperties: false
-      required: [instances]
+      description: At least one of instances or gpus is required when a body is sent.
       properties:
         instances:
           type: integer
           minimum: 1
           maximum: 64
           description: Exact desired instance count for this profile. Omit the request body entirely for legacy ensure-loaded behavior.
+        gpus:
+          type: array
+          items: {type: integer, minimum: 0}
+          uniqueItems: true
+          description: >-
+            Optional explicit GPU indices for the instances this request newly starts (only for
+            models with placement). Length must equal placement.gpu_count times the number of
+            instances started; the first gpu_count indices go to the first new instance, and so on.
+            Each instance keeps the listed order as its Docker device order. Empty or omitted means
+            automatic placement.
+    GPUInventory:
+      type: object
+      required: [sampled_at, groups, gpus]
+      properties:
+        sampled_at: {type: string, format: date-time, description: When the nvidia-smi snapshot was taken.}
+        stale: {type: boolean, description: Present and true when nvidia-smi failed and the last good snapshot (under 60 s old) is served.}
+        groups:
+          type: array
+          description: Manifest PCIe topology groups; empty when none is configured.
+          items: {type: array, items: {type: integer, minimum: 0}}
+        gpus:
+          type: array
+          items: {$ref: "#/components/schemas/GPU"}
+    GPU:
+      type: object
+      required: [index, name, memory_total_mib, memory_used_mib, memory_free_mib, utilization_percent, group, assigned]
+      properties:
+        index: {type: integer, minimum: 0}
+        name: {type: string}
+        memory_total_mib: {type: integer, minimum: 0}
+        memory_used_mib: {type: integer, minimum: 0}
+        memory_free_mib: {type: integer, minimum: 0}
+        utilization_percent: {type: [integer, "null"], minimum: 0, maximum: 100, description: Null when nvidia-smi reports it unavailable.}
+        group: {type: [integer, "null"], minimum: 0, description: Index into groups, or null when the GPU is in no group.}
+        assigned:
+          type: array
+          description: Fleet deployment instances holding this GPU, including ones still loading or stopping; empty when free.
+          items:
+            type: object
+            required: [model_id, instance_id]
+            properties:
+              model_id: {type: string}
+              instance_id: {type: string}
     ModelWithStatus:
       type: object
       required: [model, status]
@@ -248,6 +325,14 @@ components:
           type: integer
           minimum: 0
           description: Target instance count for this lifecycle operation; unload uses zero.
+        gpus:
+          type: array
+          items: {type: integer, minimum: 0}
+          description: Explicit GPU indices requested by the load, in request order; omitted for automatic placement.
+        warnings:
+          type: array
+          items: {type: string}
+          description: Non-fatal notes about the explicit GPU selection.
         state: {type: string, enum: [pending, running, succeeded, failed]}
         error: {type: string, maxLength: 1024, description: Sanitized and redacted failure text.}
         created_at: {type: string, format: date-time}

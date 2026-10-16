@@ -1,0 +1,19 @@
+ARG BASE_IMAGE=vllm/vllm-openai@sha256:8bc189bb3f57183bcaf4f01405b29d4d92d782a182b384aac79b4b2885fb1fda
+FROM ${BASE_IMAGE}
+
+# vLLM's optional B12X extra; its CUTLASS DSL pins match the base image.
+ARG B12X_VERSION=1.5.1
+RUN python3 -m pip install --no-cache-dir --no-deps "b12x==${B12X_VERSION}"
+
+COPY overrides/patch_step5_b12x_tp6.py /tmp/patch_step5_b12x_tp6.py
+COPY overrides/test_step5_b12x_tp6.py /tmp/test_step5_b12x_tp6.py
+RUN python3 /tmp/patch_step5_b12x_tp6.py \
+    && python3 /tmp/test_step5_b12x_tp6.py -v \
+    && python3 -c "from vllm.utils.b12x import get_b12x_fused_moe; assert get_b12x_fused_moe()" \
+    && rm /tmp/patch_step5_b12x_tp6.py /tmp/test_step5_b12x_tp6.py
+
+# The Fleet sequence-info wrapper runs /opt/venv/bin/python; this image uses
+# the system interpreter.
+RUN mkdir -p /opt/venv/bin && ln -s /usr/bin/python3 /opt/venv/bin/python
+
+LABEL ai.local-inference-lab.lil-fleet.b12x_version="${B12X_VERSION}"

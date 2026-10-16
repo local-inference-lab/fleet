@@ -295,8 +295,8 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(fleet.b12x.json) error = %v", err)
 	}
-	if len(cfg.Models) != 15 {
-		t.Fatalf("model count = %d, want 15", len(cfg.Models))
+	if len(cfg.Models) != 17 {
+		t.Fatalf("model count = %d, want 17", len(cfg.Models))
 	}
 	if !cfg.Runtime.ConcurrentDeployments {
 		t.Fatal("B12X manifest must enable concurrent deployments")
@@ -323,6 +323,20 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 				}
 			} else if model.IPC != "host" || len(model.SecurityOpt) != 1 || model.SecurityOpt[0] != "seccomp=unconfined" {
 				t.Fatalf("MiMo IPC/security = %q/%v", model.IPC, model.SecurityOpt)
+			}
+		})
+	}
+	for id, gpus := range map[string]int{"step5-preview-tp6": 6, "step5-preview-tp8": 8} {
+		t.Run(id+"/placement", func(t *testing.T) {
+			model, ok := cfg.Model(id)
+			if !ok {
+				t.Fatalf("model %q missing", id)
+			}
+			if model.Placement == nil || model.Placement.GPUCount != gpus {
+				t.Fatalf("placement = %+v, want %d GPUs", model.Placement, gpus)
+			}
+			if model.Image != "lil-fleet/step5-b12x:8bc189bb3f57-b12x151" {
+				t.Fatalf("image = %q, want the Dockerfile.step5-b12x build tag", model.Image)
 			}
 		})
 	}

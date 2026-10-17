@@ -291,9 +291,9 @@ func TestLoadAllowsUnlimitedMemorySwapWhenMemoryLimitIsSet(t *testing.T) {
 }
 
 func TestB12XFleetManifestIsValid(t *testing.T) {
-	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json"))
+	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json.example"))
 	if err != nil {
-		t.Fatalf("Load(fleet.b12x.json) error = %v", err)
+		t.Fatalf("Load(fleet.b12x.json.example) error = %v", err)
 	}
 	if len(cfg.Models) != 16 {
 		t.Fatalf("model count = %d, want 16", len(cfg.Models))
@@ -516,7 +516,7 @@ func TestB12XFleetManifestIsValid(t *testing.T) {
 }
 
 func TestDerivedTP4Profiles(t *testing.T) {
-	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json"))
+	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json.example"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -652,7 +652,7 @@ func writeManifest(t *testing.T, body string) string {
 }
 
 func TestMiMoProEncoderDriverCompatibility(t *testing.T) {
-	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json"))
+	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json.example"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -719,7 +719,7 @@ func TestHostNetworkAllowsLoopbackBinds(t *testing.T) {
 }
 
 func TestShippedManifestsKeepHostNetworkListenersOnLoopback(t *testing.T) {
-	for _, name := range []string{"fleet.b12x.json", "fleet.example.json"} {
+	for _, name := range []string{"fleet.b12x.json.example", "fleet.example.json"} {
 		cfg, err := Load(filepath.Join("..", "..", name))
 		if err != nil {
 			t.Fatalf("Load(%s) error = %v", name, err)
@@ -845,7 +845,7 @@ func TestLoadValidatesContainerHardeningOverrides(t *testing.T) {
 }
 
 func TestB12XWritableCachesArePerModel(t *testing.T) {
-	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json"))
+	cfg, err := Load(filepath.Join("..", "..", "fleet.b12x.json.example"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -886,7 +886,7 @@ func TestRuntimeStopAndPullTimeouts(t *testing.T) {
 // Every vLLM profile must expose /server_info so llmconduit mesh workers with
 // capacity_source: vllm advertise it; each keeps its original launcher.
 func TestEveryProfileExposesSequenceInfo(t *testing.T) {
-	cfg, err := Load("../../fleet.b12x.json")
+	cfg, err := Load("../../fleet.b12x.json.example")
 	if err != nil {
 		t.Fatal(err)
 	}

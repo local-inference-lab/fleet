@@ -19,3 +19,4 @@ __pycache__/
 *.pyc
 Dockerfile.slopllm-*
 overrides/slopllm-*
+/fleet.b12x.json

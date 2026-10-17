@@ -164,13 +164,13 @@ Finished operations are kept for one hour, and at most 256 are retained; older o
 
 ## Patched B12X fleet
 
-[`fleet.b12x.json`](fleet.b12x.json) contains example RTX PRO 6000 profiles for an eight-GPU system with two PCIe groups. Copy it to the ignored `fleet.json`, then adjust the example topology groups `[0,1,6,7]` and `[2,3,4,5]` and `/mnt/llm_stuff` mount paths for the Docker daemon host. Build its pinned runtime overrides first:
+[`fleet.b12x.json.example`](fleet.b12x.json.example) contains example RTX PRO 6000 profiles for an eight-GPU system with two PCIe groups. Copy it to the ignored `fleet.json`, then adjust the example topology groups `[0,1,6,7]` and `[2,3,4,5]` and `/mnt/llm_stuff` mount paths for the Docker daemon host. Build its pinned runtime overrides first:
 
 ```sh
 docker build -f Dockerfile.b12x-override \
   --build-arg B12X_REF=f20ab3bad7def65f6211403fb73f9b1e8a33dfb0 \
   -t lil-fleet/b12x:f20ab3bad7de .
-cp fleet.b12x.json fleet.json
+cp fleet.b12x.json.example fleet.json
 # Adjust fleet.json for the host before starting the controller.
 go run ./cmd/lil-fleet -manifest fleet.json -token-file .secrets/api-token
 ```
